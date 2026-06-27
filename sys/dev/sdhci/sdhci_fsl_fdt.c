@@ -48,6 +48,7 @@
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/sdhci/sdhci.h>
 #include <dev/sdhci/sdhci_fdt_gpio.h>
+#include <dev/sdhci/sdhci_fsl.h>
 
 #include "mmcbr_if.h"
 #include "sdhci_if.h"
@@ -183,34 +184,10 @@
 
 #define SDHCI_FSL_MAX_RETRIES		20000	/* DELAY(10) * this = 200ms */
 
-struct sdhci_fsl_fdt_softc {
-	device_t				dev;
-	const struct sdhci_fsl_fdt_soc_data	*soc_data;
-	struct resource				*mem_res;
-	struct resource				*irq_res;
-	void					*irq_cookie;
-	uint32_t				baseclk_hz;
-	uint32_t				maxclk_hz;
-	struct sdhci_fdt_gpio			*gpio;
-	struct sdhci_slot			slot;
-	bool					slot_init_done;
-	uint32_t				cmd_and_mode;
-	uint16_t				sdclk_bits;
-	struct mmc_helper			fdt_helper;
-	uint32_t				div_ratio;
-	uint8_t					vendor_ver;
-	uint32_t				flags;
-
-	uint32_t (* read)(struct sdhci_fsl_fdt_softc *, bus_size_t);
-	void (* write)(struct sdhci_fsl_fdt_softc *, bus_size_t, uint32_t);
-};
-
-struct sdhci_fsl_fdt_soc_data {
-	int quirks;
-	int baseclk_div;
-	uint8_t errata;
-	char *syscon_compat;
-};
+/*
+ * struct sdhci_fsl_fdt_softc and struct sdhci_fsl_fdt_soc_data now live in
+ * <dev/sdhci/sdhci_fsl.h> so they can be shared with the ACPI front-end.
+ */
 
 static const struct sdhci_fsl_fdt_soc_data sdhci_fsl_fdt_ls1012a_soc_data = {
 	.quirks = 0,
@@ -234,7 +211,8 @@ static const struct sdhci_fsl_fdt_soc_data sdhci_fsl_fdt_ls1046a_soc_data = {
 	.syscon_compat = "fsl,ls1046a-scfg",
 };
 
-static const struct sdhci_fsl_fdt_soc_data sdhci_fsl_fdt_lx2160a_soc_data = {
+/* Shared with the ACPI front-end (declared in sdhci_fsl.h). */
+const struct sdhci_fsl_fdt_soc_data sdhci_fsl_fdt_lx2160a_soc_data = {
 	.quirks = 0,
 	.baseclk_div = 2,
 	.errata = SDHCI_FSL_UNRELIABLE_PULSE_DET |
@@ -755,6 +733,9 @@ sdhci_fsl_fdt_get_ro(device_t bus, device_t child)
 	struct sdhci_fsl_fdt_softc *sc;
 
 	sc = device_get_softc(bus);
+	/* No FDT write-protect GPIO (e.g. ACPI front-end): use the std reg. */
+	if (sc->gpio == NULL)
+		return (sdhci_generic_get_ro(bus, child));
 	return (sdhci_fdt_gpio_get_readonly(sc->gpio));
 }
 
@@ -803,8 +784,12 @@ sdhci_fsl_fdt_vddrange_to_mask(device_t dev, uint32_t *vdd_ranges, int len)
 	return (vdd_mask);
 }
 
+/*
+ * Apply the FDT "voltage-ranges" property over the capabilities that
+ * sdhci_fsl_attach_common() already read from hardware. FDT front-end only.
+ */
 static void
-sdhci_fsl_fdt_of_parse(device_t dev)
+sdhci_fsl_fdt_voltage_fixup(device_t dev)
 {
 	struct sdhci_fsl_fdt_softc *sc;
 	phandle_t node;
@@ -815,16 +800,6 @@ sdhci_fsl_fdt_of_parse(device_t dev)
 	sc = device_get_softc(dev);
 	node = ofw_bus_get_node(dev);
 
-	/* Call mmc_fdt_parse in order to get mmc related properties. */
-	mmc_fdt_parse(dev, node, &sc->fdt_helper, &sc->slot.host);
-
-	sc->slot.quirks |= SDHCI_QUIRK_MISSING_CAPS;
-	sc->slot.caps = sdhci_fsl_fdt_read_4(dev, &sc->slot,
-	    SDHCI_CAPABILITIES) & ~(SDHCI_CAN_DO_SUSPEND);
-	sc->slot.caps2 = sdhci_fsl_fdt_read_4(dev, &sc->slot,
-	    SDHCI_CAPABILITIES2);
-
-	/* Parse the "voltage-ranges" dts property. */
 	num_ranges = OF_getencprop_alloc(node, "voltage-ranges",
 	    (void **) &voltage_ranges);
 	if (num_ranges <= 0)
@@ -859,39 +834,37 @@ sdhci_fsl_poll_register(struct sdhci_fsl_fdt_softc *sc,
 	return (0);
 }
 
-static int
-sdhci_fsl_fdt_attach(device_t dev)
+/*
+ * Bus-agnostic attach. The bus front-end must have filled soc_data,
+ * baseclk_hz, little_endian, acpi and the parsed mmc host properties
+ * (slot.host) in the softc before calling this.
+ */
+int
+sdhci_fsl_attach_common(device_t dev)
 {
 	struct sdhci_fsl_fdt_softc *sc;
 	struct mmc_host *host;
 	uint32_t val, buf_order;
-	uintptr_t ocd_data;
-	uint64_t clk_hz;
-	phandle_t node;
 	int rid, ret;
-	clk_t clk;
 
-	node = ofw_bus_get_node(dev);
 	sc = device_get_softc(dev);
-	ocd_data = ofw_bus_search_compatible(dev,
-	    sdhci_fsl_fdt_compat_data)->ocd_data;
 	sc->dev = dev;
 	sc->flags = 0;
 	host = &sc->slot.host;
-	rid = 0;
-
-	/*
-	 * LX2160A needs its own soc_data in order to apply SoC
-	 * specific quriks. Since the controller is identified
-	 * only with a generic compatible string we need to do this dance here.
-	 */
-	if (ofw_bus_node_is_compatible(OF_finddevice("/"), "fsl,lx2160a"))
-		sc->soc_data = &sdhci_fsl_fdt_lx2160a_soc_data;
-	else
-		sc->soc_data = (struct sdhci_fsl_fdt_soc_data *)ocd_data;
-
 	sc->slot.quirks = sc->soc_data->quirks;
 
+	/* eSDHC block endianness; chosen by the bus front-end. */
+	if (sc->little_endian) {
+		sc->read = read_le;
+		sc->write = write_le;
+		buf_order = SDHCI_FSL_PROT_CTRL_BYTE_NATIVE;
+	} else {
+		sc->read = read_be;
+		sc->write = write_be;
+		buf_order = SDHCI_FSL_PROT_CTRL_BYTE_SWAP;
+	}
+
+	rid = 0;
 	sc->mem_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
 	    RF_ACTIVE);
 	if (sc->mem_res == NULL) {
@@ -917,36 +890,20 @@ sdhci_fsl_fdt_attach(device_t dev)
 		goto err_free_irq_res;
 	}
 
-	ret = clk_get_by_ofw_index(dev, node, 0, &clk);
-	if (ret != 0) {
-		device_printf(dev, "Parent clock not found\n");
-		goto err_free_irq;
-	}
-
-	ret = clk_get_freq(clk, &clk_hz);
-	if (ret != 0) {
-		device_printf(dev,
-		    "Could not get parent clock frequency\n");
-		goto err_free_irq;
-	}
-
-	sc->baseclk_hz = clk_hz / sc->soc_data->baseclk_div;
-
-	/* Figure out eSDHC block endianness before we touch any HW regs. */
-	if (OF_hasprop(node, "little-endian")) {
-		sc->read = read_le;
-		sc->write = write_le;
-		buf_order = SDHCI_FSL_PROT_CTRL_BYTE_NATIVE;
-	} else {
-		sc->read = read_be;
-		sc->write = write_be;
-		buf_order = SDHCI_FSL_PROT_CTRL_BYTE_SWAP;
-	}
-
 	sc->vendor_ver = (RD4(sc, SDHCI_FSL_HOST_VERSION) &
 	    SDHCI_VENDOR_VER_MASK) >> SDHCI_VENDOR_VER_SHIFT;
 
-	sdhci_fsl_fdt_of_parse(dev);
+	/* Capabilities are missing from the standard registers; read them. */
+	sc->slot.quirks |= SDHCI_QUIRK_MISSING_CAPS;
+	sc->slot.caps = sdhci_fsl_fdt_read_4(dev, &sc->slot,
+	    SDHCI_CAPABILITIES) & ~(SDHCI_CAN_DO_SUSPEND);
+	sc->slot.caps2 = sdhci_fsl_fdt_read_4(dev, &sc->slot,
+	    SDHCI_CAPABILITIES2);
+
+	/* FDT may override the voltage caps via "voltage-ranges". */
+	if (!sc->acpi)
+		sdhci_fsl_fdt_voltage_fixup(dev);
+
 	sc->maxclk_hz = host->f_max ? host->f_max : sc->baseclk_hz;
 
 	/*
@@ -971,7 +928,10 @@ sdhci_fsl_fdt_attach(device_t dev)
 	val = RD4(sc, SDHCI_FSL_ESDHC_CTRL);
 	WR4(sc, SDHCI_FSL_ESDHC_CTRL, val | SDHCI_FSL_ESDHC_CTRL_CLK_DIV2);
 	sc->slot.max_clk = sc->maxclk_hz;
-	sc->gpio = sdhci_fdt_gpio_setup(dev, &sc->slot);
+
+	/* GPIO card-detect is an FDT-only facility. */
+	if (!sc->acpi)
+		sc->gpio = sdhci_fdt_gpio_setup(dev, &sc->slot);
 
 	/*
 	 * Set the buffer watermark level to 128 words (512 bytes) for both
@@ -992,6 +952,16 @@ sdhci_fsl_fdt_attach(device_t dev)
 	ret = sdhci_init_slot(dev, &sc->slot, 0);
 	if (ret != 0)
 		goto err_free_gpio;
+
+	/*
+	 * The eSDHC's SDHCI present-state card-detect bits are unreliable; the
+	 * FDT path works around this with a GPIO card-detect line, which is not
+	 * available under ACPI. Mark the slot non-removable so sdhci attaches
+	 * the mmc bus without waiting for a (never-stable) card-detect.
+	 */
+	if (sc->acpi)
+		sc->slot.opt |= SDHCI_NON_REMOVABLE;
+
 	sc->slot_init_done = true;
 	sdhci_start_slot(&sc->slot);
 
@@ -999,8 +969,8 @@ sdhci_fsl_fdt_attach(device_t dev)
 	return (0);
 
 err_free_gpio:
-	sdhci_fdt_gpio_teardown(sc->gpio);
-err_free_irq:
+	if (sc->gpio != NULL)
+		sdhci_fdt_gpio_teardown(sc->gpio);
 	bus_teardown_intr(dev, sc->irq_res, sc->irq_cookie);
 err_free_irq_res:
 	bus_free_resource(dev, SYS_RES_IRQ, sc->irq_res);
@@ -1010,7 +980,54 @@ err_free_mem:
 }
 
 static int
-sdhci_fsl_fdt_detach(device_t dev)
+sdhci_fsl_fdt_attach(device_t dev)
+{
+	struct sdhci_fsl_fdt_softc *sc;
+	uintptr_t ocd_data;
+	uint64_t clk_hz;
+	phandle_t node;
+	clk_t clk;
+	int ret;
+
+	node = ofw_bus_get_node(dev);
+	sc = device_get_softc(dev);
+	ocd_data = ofw_bus_search_compatible(dev,
+	    sdhci_fsl_fdt_compat_data)->ocd_data;
+
+	/*
+	 * LX2160A needs its own soc_data in order to apply SoC
+	 * specific quriks. Since the controller is identified
+	 * only with a generic compatible string we need to do this dance here.
+	 */
+	if (ofw_bus_node_is_compatible(OF_finddevice("/"), "fsl,lx2160a"))
+		sc->soc_data = &sdhci_fsl_fdt_lx2160a_soc_data;
+	else
+		sc->soc_data = (const struct sdhci_fsl_fdt_soc_data *)ocd_data;
+
+	/* Parent (peripheral) clock comes from the FDT clock framework. */
+	ret = clk_get_by_ofw_index(dev, node, 0, &clk);
+	if (ret != 0) {
+		device_printf(dev, "Parent clock not found\n");
+		return (ret);
+	}
+	ret = clk_get_freq(clk, &clk_hz);
+	if (ret != 0) {
+		device_printf(dev, "Could not get parent clock frequency\n");
+		return (ret);
+	}
+	sc->baseclk_hz = clk_hz / sc->soc_data->baseclk_div;
+
+	sc->little_endian = OF_hasprop(node, "little-endian");
+	sc->acpi = false;
+
+	/* mmc host properties from the FDT node. */
+	mmc_fdt_parse(dev, node, &sc->fdt_helper, &sc->slot.host);
+
+	return (sdhci_fsl_attach_common(dev));
+}
+
+int
+sdhci_fsl_detach(device_t dev)
 {
 	struct sdhci_fsl_fdt_softc *sc;
 
@@ -1514,12 +1531,11 @@ sdhci_fsl_fdt_set_uhs_timing(device_t dev, struct sdhci_slot *slot)
 	}
 }
 
-static const device_method_t sdhci_fsl_fdt_methods[] = {
-	/* Device interface. */
-	DEVMETHOD(device_probe,			sdhci_fsl_fdt_probe),
-	DEVMETHOD(device_attach,		sdhci_fsl_fdt_attach),
-	DEVMETHOD(device_detach,		sdhci_fsl_fdt_detach),
-
+/*
+ * Bus-agnostic base class. The FDT and ACPI front-ends subclass this and
+ * override only device_probe/attach/detach (and, for ACPI, card-present).
+ */
+static const device_method_t sdhci_fsl_methods[] = {
 	/* Bus interface. */
 	DEVMETHOD(bus_read_ivar,		sdhci_fsl_fdt_read_ivar),
 	DEVMETHOD(bus_write_ivar,		sdhci_fsl_fdt_write_ivar),
@@ -1549,11 +1565,28 @@ static const device_method_t sdhci_fsl_fdt_methods[] = {
 	DEVMETHOD_END
 };
 
-static driver_t sdhci_fsl_fdt_driver = {
-	"sdhci_fsl_fdt",
-	sdhci_fsl_fdt_methods,
-	sizeof(struct sdhci_fsl_fdt_softc),
+DEFINE_CLASS_0(sdhci_fsl, sdhci_fsl_driver, sdhci_fsl_methods,
+    sizeof(struct sdhci_fsl_fdt_softc));
+
+/*
+ * Attach the mmc bus to the shared "sdhci_fsl" devclass (both the FDT and ACPI
+ * subclasses create devices of this class). Without this the controller
+ * attaches but the mmc bridge never does, so no card enumerates.
+ */
+#ifndef MMCCAM
+MMC_DECLARE_BRIDGE(sdhci_fsl);
+#endif
+
+/* FDT front-end. */
+static const device_method_t sdhci_fsl_fdt_methods[] = {
+	DEVMETHOD(device_probe,			sdhci_fsl_fdt_probe),
+	DEVMETHOD(device_attach,		sdhci_fsl_fdt_attach),
+	DEVMETHOD(device_detach,		sdhci_fsl_detach),
+	DEVMETHOD_END
 };
+
+DEFINE_CLASS_1(sdhci_fsl, sdhci_fsl_fdt_driver, sdhci_fsl_fdt_methods,
+    sizeof(struct sdhci_fsl_fdt_softc), sdhci_fsl_driver);
 
 DRIVER_MODULE(sdhci_fsl_fdt, simplebus, sdhci_fsl_fdt_driver, NULL, NULL);
 SDHCI_DEPEND(sdhci_fsl_fdt);
