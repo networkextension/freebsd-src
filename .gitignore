@@ -1,0 +1,12 @@
+# FreeBSD kmod build artifacts
+*.o
+*.ko
+*.kld
+*.kld.debug
+*.ko.debug
+.depend*
+opt_*.h
+machine
+*_if.h
+export_syms
+.tmp_*
