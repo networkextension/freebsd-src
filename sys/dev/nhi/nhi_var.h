@@ -99,6 +99,7 @@ struct nhi_softc {
 	bool			tbip_login_received;	/* we replied to peer login */
 	bool			paths_approved;
 	int			login_last;	/* ticks of our last proactive LOGIN */
+	u_int			login_tries;	/* proactive LOGINs sent (cap 60) */
 
 	/* if_tbt(4) data plane (Phase 3b): rings + ifnet + RX reassembly. */
 	struct ifnet		*ifp;		/* tbt0 */

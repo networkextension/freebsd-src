@@ -108,6 +108,7 @@ nhi_tbt_disconnect(struct nhi_softc *sc)
 	sc->tbip_login_sent = false;
 	sc->tbip_login_received = false;
 	sc->login_last = 0;
+	sc->login_tries = 0;
 	sc->paths_approved = false;
 
 	if (sc->ifp != NULL) {

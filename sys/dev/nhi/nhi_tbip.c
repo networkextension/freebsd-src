@@ -132,8 +132,6 @@ tbip_send_login(struct nhi_softc *sc)
 	/* macOS AppleThunderboltIP sends/expects ThunderboltIP frames as
 	 * XDOMAIN_RESP (pdf=7), same as our LOGIN_RESPONSE. */
 	nhi_ctl_tx(sc, NHI_PDF_XDOMAIN_RESP, r, total);
-	device_printf(sc->dev, "tbip: sent LOGIN (our tx_hopid=%u)\n",
-	    sc->local_tx_hopid);
 }
 
 /*
@@ -147,9 +145,27 @@ nhi_tbip_start_login(struct nhi_softc *sc)
 {
 	if (!sc->has_peer || sc->paths_approved)
 		return;
+	/*
+	 * Cap retries (Linux tbnet TBNET_LOGIN_RETRIES = 60): a peer that went
+	 * away or rebooted has a new domain UUID and will never accept these -
+	 * without a cap we spam the ring + dmesg forever if the firmware fails
+	 * to send XDOMAIN_DISCONNECTED (observed on integrated MTL).
+	 */
+	if (sc->login_tries >= 60) {
+		if (sc->login_tries == 60) {
+			sc->login_tries++;
+			device_printf(sc->dev,
+			    "tbip: out of login retries, giving up\n");
+		}
+		return;
+	}
 	if (sc->login_last != 0 && (ticks - sc->login_last) < 2 * hz)
 		return;
 	sc->login_last = ticks;
+	sc->login_tries++;
+	if (sc->login_tries == 1 || (sc->login_tries % 15) == 0)
+		device_printf(sc->dev, "tbip: LOGIN attempt %u (tx_hopid=%u)\n",
+		    sc->login_tries, sc->local_tx_hopid);
 	tbip_send_login(sc);
 }
 

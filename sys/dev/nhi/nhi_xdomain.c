@@ -281,12 +281,14 @@ nhi_xdomain_handle(struct nhi_softc *sc, const uint8_t *f, u_int len)
 	type = le32dec(f + 28);
 
 	/*
-	 * Respond toward the peer using the route learned from XDOMAIN_CONNECTED.
-	 * Echoing the request's own route sends the reply back to our own host
-	 * router (the loopback we observed), so use peer_route instead.
+	 * Respond to the route the request CAME FROM, with the top bit cleared
+	 * (Linux tb_xdp_handle_request: route = (route_hi<<32|route_lo) &
+	 * ~BIT_ULL(63)).  Echoing the route verbatim (bit63 set) looped the
+	 * reply back to our own host router; using the stored peer_route broke
+	 * multi-hop (dock) topologies where the peer's request route differs.
 	 */
-	rhi = sc->peer_route_hi;
-	rlo = sc->peer_route_lo;
+	rhi = req_rhi & 0x7fffffff;
+	rlo = req_rlo;
 	device_printf(sc->dev,
 	    "xdomain rx type=%u len=%u reqroute=%x:%x peerroute=%x:%x\n",
 	    type, len, req_rhi, req_rlo, rhi, rlo);

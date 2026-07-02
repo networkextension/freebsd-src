@@ -144,13 +144,16 @@ nhi_icm_handle_event(struct nhi_softc *sc, const uint8_t *f, u_int len)
 		memcpy(sc->local_uuid, f + 24, 16);
 		sc->local_route_hi = le32dec(f + 40);
 		sc->local_route_lo = le32dec(f + 44);
-		if (len >= 56) {
-			sc->peer_route_hi = le32dec(f + 48);
-			sc->peer_route_lo = le32dec(f + 52);
-		} else {
-			sc->peer_route_hi = sc->local_route_hi;
-			sc->peer_route_lo = sc->local_route_lo;
-		}
+		/*
+		 * The route we USE to reach the peer is the event's LOCAL route
+		 * (Linux icm_tr_xdomain_connected: route = get_route(pkg->
+		 * local_route_hi, local_route_lo) -> tb_xdomain_alloc).  The
+		 * remote_route field is the path as seen from the peer's side -
+		 * using it broke multi-hop topologies (peer behind a dock at
+		 * hop 3 while our path to it is 0:1).
+		 */
+		sc->peer_route_hi = sc->local_route_hi;
+		sc->peer_route_lo = sc->local_route_lo;
 		sc->has_peer = true;
 		nhi_tbt_disconnect(sc);	/* clean any stale session from a prior cycle */
 		nhi_tbip_init(sc);	/* derive our MAC from the local UUID */
