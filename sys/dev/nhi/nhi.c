@@ -300,6 +300,31 @@ nhi_dbg_hopdump(struct nhi_softc *sc)
 }
 
 /*
+ * Experiment (dev.nhi.N.credits=1): bump the lane RX path entry's initial
+ * credits (fw programs 14; effective E2E window toward us measures ~3
+ * frames per 1ms tick = the 32 Mbit/s Mac->us ceiling).  Recoverable:
+ * reset=1 makes the fw reprogram the entry.
+ */
+static void
+nhi_dbg_credits(struct nhi_softc *sc)
+{
+	uint8_t req[20];
+	uint32_t addr, dw0;
+
+	bzero(req, sizeof(req));
+	addr = (16 & 0x1fff) | (2u << 13) | (1u << 19) |  /* port1 HOPS[8] */
+	    (0u << 25) | (1u << 27);
+	le32enc(req + 8, addr);
+	/* fw entry 0x801c3802: credits field (bits 24:17) 14 -> 64 */
+	dw0 = (0x801c3802u & ~(0xffu << 17)) | (64u << 17);
+	le32enc(req + 12, dw0);
+	le32enc(req + 16, 0x0180c501);
+	nhi_ctl_tx(sc, 2, req, sizeof(req));
+	device_printf(sc->dev, "credits: lane HOPS[8] dw0=0x%08x (credits 64)\n",
+	    dw0);
+}
+
+/*
  * Software "cable replug": re-arm the ICM without touching hardware cables.
  * level 1 (rescan) re-issues DRIVER_READY - a healthy ICM replays its topology
  * (DEVICE/XDOMAIN_CONNECTED) to the driver.  level 2 (reset) force-power
@@ -329,6 +354,10 @@ nhi_handle_reset(struct nhi_softc *sc, int level)
 			DELAY(5000);
 		}
 		device_printf(sc->dev, "portdump: PORT space dw2 (type), ports 1-9\n");
+		return;
+	}
+	if (level == 6) {
+		nhi_dbg_credits(sc);
 		return;
 	}
 	if (level == 5) {
@@ -429,12 +458,21 @@ nhi_event_loop(void *arg)
 		nhi_tbip_start_login(sc);	/* active P2P: (re)send our LOGIN */
 		/*
 		 * MSI doesn't fire on 16.0-CURRENT (intr_count stays 0), so RX
-		 * is polling-driven.  50 ms ticks capped Mac->us at ~0.5 Mbit/s
-		 * (E2E credits also only returned once per tick).  Poll fast
-		 * while the data path is up; TODO: fix interrupts properly.
+		 * is polling-driven and the poll rate IS the throughput
+		 * ceiling (the peer's E2E window refills once per drain).
+		 * While the data path is up, busy-poll at ~20 kHz between
+		 * ticks; otherwise idle at 20 Hz.  TODO: fix interrupts.
 		 */
-		tsleep(__DEVOLATILE(void *, &sc->event_run), 0, "nhiev",
-		    sc->data_up ? 1 : hz / 20);
+		if (sc->data_up) {
+			int spin;
+
+			for (spin = 0; spin < 20 && sc->event_run; spin++) {
+				DELAY(50);
+				nhi_tbt_rx_poll(sc);
+			}
+		} else
+			tsleep(__DEVOLATILE(void *, &sc->event_run), 0,
+			    "nhiev", hz / 20);
 	}
 	sc->event_td = NULL;
 	wakeup(sc);
@@ -549,6 +587,10 @@ nhi_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "pathfix",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 5,
 	    nhi_sysctl_reset, "I", "debug: manually install NHI TX hop entry");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "credits",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 6,
+	    nhi_sysctl_reset, "I", "debug: bump lane RX path credits 14 -> 64");
 
 	return (0);
 }

@@ -587,6 +587,19 @@ nhi_data_tx(struct nhi_softc *sc, const void *frame, u_int len)
 		return (EINVAL);
 
 	slot = tx->head;
+	d = &tx->desc[slot];
+	/*
+	 * TX flow control: if the slot we are about to reuse is still owned
+	 * by the hardware (POSTED but not COMPLETED), the ring is full -
+	 * overwriting it silently lost frames at line rate (TCP saw them as
+	 * ~15k retransmits per 10 s).
+	 */
+	{
+		uint32_t dflags = (d->attrs >> NHI_DESC_FLAGS_SHIFT) & 0xf;
+		if ((dflags & NHI_RING_DESC_POSTED) != 0 &&
+		    (dflags & NHI_RING_DESC_COMPLETED) == 0)
+			return (ENOBUFS);
+	}
 	fbuf = (uint8_t *)tx->buf + (size_t)slot * tx->frame_size;
 	memcpy(fbuf, frame, len);
 	bus_dmamap_sync(tx->buf_tag, tx->buf_map, BUS_DMASYNC_PREWRITE);

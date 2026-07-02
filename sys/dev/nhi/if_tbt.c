@@ -24,6 +24,7 @@
 #include <sys/mbuf.h>
 #include <sys/mutex.h>
 #include <sys/socket.h>
+#include <sys/sockio.h>
 #include <machine/bus.h>
 
 #include <net/if.h>
@@ -204,7 +205,20 @@ tbt_init(void *arg)
 static int
 tbt_ioctl(if_t ifp, u_long cmd, caddr_t data)
 {
-	return (ether_ioctl(ifp, cmd, data));
+	struct ifreq *ifr = (struct ifreq *)data;
+
+	switch (cmd) {
+	case SIOCSIFMTU:
+		/* Jumbo: TX fragments into 4 KB ring frames and RX
+		 * reassembles (frame_count), so anything up to the tbnet
+		 * 9K range just works; 1500 costs ~270k pps at 3 Gbit/s. */
+		if (ifr->ifr_mtu < ETHERMIN || ifr->ifr_mtu > 9216)
+			return (EINVAL);
+		if_setmtu(ifp, ifr->ifr_mtu);
+		return (0);
+	default:
+		return (ether_ioctl(ifp, cmd, data));
+	}
 }
 
 /* Validate a received frame header (Linux tbnet_check_frame). */

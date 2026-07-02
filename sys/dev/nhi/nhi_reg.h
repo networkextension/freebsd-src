@@ -302,7 +302,8 @@ struct nhi_ring_desc {
 /* Data rings for the network service (ring 0 is control). */
 #define	NHI_DATA_TX_RING		1
 #define	NHI_DATA_RX_RING		2
-#define	NHI_DATA_RING_COUNT		256
+#define	NHI_DATA_RING_COUNT		1024	/* 256 overflowed between 1 ms
+						 * polls at line rate */
 #define	NHI_DATA_FRAME_SIZE		4096
 
 /*
