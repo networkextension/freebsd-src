@@ -30,6 +30,14 @@ struct nhi_ring {
 	u_int			count;		/* descriptors in the ring */
 	u_int			frame_size;	/* bytes per frame buffer */
 
+	/* Frame-mode (data rings; Linux RING_FLAG_FRAME): no RAW flag, RX
+	 * filters by PDF sof/eof masks, optional E2E flow control. */
+	bool			frame_mode;
+	uint16_t		sof_mask;	/* RX: accepted SOF PDF bitmask */
+	uint16_t		eof_mask;	/* RX: accepted EOF PDF bitmask */
+	bool			e2e;		/* RX: enable E2E flow control */
+	uint16_t		e2e_hop;	/* RX: TX ring feeding credits */
+
 	/* Descriptor ring (coherent). */
 	bus_dma_tag_t		desc_tag;
 	bus_dmamap_t		desc_map;
@@ -76,6 +84,7 @@ struct nhi_softc {
 	/* Ring-0 RX event loop (nhi_event_loop). */
 	struct thread		*event_td;
 	volatile int		event_run;
+	volatile int		reset_req;	/* 1=rescan (DRIVER_READY), 2=full power cycle */
 
 	/* XDomain state (nhi_xdomain.c). */
 	bool			has_peer;	/* an XDOMAIN_CONNECTED seen */
@@ -100,6 +109,7 @@ struct nhi_softc {
 	bool			paths_approved;
 	int			login_last;	/* ticks of our last proactive LOGIN */
 	u_int			login_tries;	/* proactive LOGINs sent (cap 60) */
+	u_int			logout_kicks;	/* half-open LOGOUT kicks (cap 3) */
 
 	/* if_tbt(4) data plane (Phase 3b): rings + ifnet + RX reassembly. */
 	struct ifnet		*ifp;		/* tbt0 */
@@ -154,6 +164,7 @@ void		nhi_tbip_handle(struct nhi_softc *sc, const uint8_t *frame,
 		    u_int len);
 void		nhi_tbip_start_login(struct nhi_softc *sc);
 void		nhi_tbip_logout(struct nhi_softc *sc);
+bool		nhi_tbip_uuid_is_local(const uint8_t *uuid);
 
 /* nhi_ring.c - data-ring (network service) transport, raw DMA (Phase 3b). */
 int		nhi_data_setup(struct nhi_softc *sc);
@@ -163,6 +174,10 @@ int		nhi_data_rx(struct nhi_softc *sc, void *buf, u_int *len);
 
 /* nhi_icm.c - APPROVE_XDOMAIN_PATHS: program the bidirectional data tunnel. */
 int		nhi_icm_approve_xdomain_paths(struct nhi_softc *sc);
+/* nhi_icm.c - fabric-level XDomain teardown (peer sees the drop too). */
+int		nhi_icm_disconnect_xdomain(struct nhi_softc *sc);
+/* nhi_icm.c - install the NHI-side TX hop entry the MTL ICM leaves empty. */
+int		nhi_install_tx_hop(struct nhi_softc *sc);
 
 /* if_tbt.c - ThunderboltIP ifnet "tbt0" (Phase 3b). */
 int		nhi_tbt_connect(struct nhi_softc *sc);

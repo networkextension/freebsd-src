@@ -76,15 +76,43 @@ tbip_jhash2(const uint32_t *k, uint32_t length, uint32_t initval)
 }
 
 /*
- * Derive our synthetic MAC from the local domain UUID; pick our TX HopID.
- * Matches Linux tbnet_generate_mac (phy_port is 0 for our single link).
+ * Module-wide registry of LOCAL domain UUIDs (one per NHI instance) so each
+ * instance can reject frames that originate from this same machine - the
+ * self/sibling loop guard in nhi_tbip_handle.
  */
+static uint8_t	nhi_tbip_local_uuids[4][16];
+static int	nhi_tbip_local_cnt;
+
+static void
+nhi_tbip_register_local(const uint8_t *uuid)
+{
+	int i;
+
+	for (i = 0; i < nhi_tbip_local_cnt; i++)
+		if (memcmp(nhi_tbip_local_uuids[i], uuid, 16) == 0)
+			return;
+	if (nhi_tbip_local_cnt < 4)
+		memcpy(nhi_tbip_local_uuids[nhi_tbip_local_cnt++], uuid, 16);
+}
+
+bool
+nhi_tbip_uuid_is_local(const uint8_t *uuid)
+{
+	int i;
+
+	for (i = 0; i < nhi_tbip_local_cnt; i++)
+		if (memcmp(nhi_tbip_local_uuids[i], uuid, 16) == 0)
+			return (true);
+	return (false);
+}
+
 void
 nhi_tbip_init(struct nhi_softc *sc)
 {
 	uint32_t k[4], hash;
 	int i;
 
+	nhi_tbip_register_local(sc->local_uuid);
 	for (i = 0; i < 4; i++)
 		k[i] = le32dec(sc->local_uuid + i * 4);
 	sc->tbt_mac[0] = (0 << 4) | 0x02;	/* locally administered, unicast */
@@ -143,7 +171,7 @@ tbip_send_login(struct nhi_softc *sc)
 void
 nhi_tbip_start_login(struct nhi_softc *sc)
 {
-	if (!sc->has_peer || sc->paths_approved)
+	if (!sc->has_peer || sc->paths_approved || sc->tbip_login_sent)
 		return;
 	/*
 	 * Cap retries (Linux tbnet TBNET_LOGIN_RETRIES = 60): a peer that went
@@ -197,20 +225,59 @@ nhi_tbip_handle(struct nhi_softc *sc, const uint8_t *f, u_int len)
 
 	if (len < NHI_TBIP_HDR_LEN)
 		return;
+	/*
+	 * Self-frame guard: the fabric can loop our own or our SIBLING NHI's
+	 * frames back at us; without this we complete a login with ourselves
+	 * (observed: nhi0's proactive LOGINs arriving at nhi1, "LOGIN
+	 * COMPLETE" and a tbt interface talking to a mirror).  Check the
+	 * initiator against every local domain UUID this module has seen.
+	 */
+	if (nhi_tbip_uuid_is_local(f + 28))
+		return;
 	length_sn = le32dec(f + 8);
 	type = le32dec(f + NHI_TBIP_OFF_TYPE);
 	command_id = le32dec(f + NHI_TBIP_OFF_COMMAND_ID);
+
+	/*
+	 * Self-heal the peer UUID from the frame's initiator field: the peer
+	 * may have rebooted (new domain UUID) without the firmware raising a
+	 * new XDOMAIN_CONNECTED - replies addressed to the stale UUID are
+	 * silently dropped by macOS.  Always answer the UUID that asked.
+	 * Only for REQUEST types (initiator == sender); in responses the
+	 * initiator field echoes us.
+	 */
+	if ((type == NHI_TBIP_LOGIN || type == NHI_TBIP_LOGOUT) &&
+	    memcmp(sc->peer_uuid, f + 28, 16) != 0) {
+		device_printf(sc->dev,
+		    "tbip: peer UUID changed (%02x%02x%02x%02x-... -> "
+		    "%02x%02x%02x%02x-...), adopting\n",
+		    sc->peer_uuid[0], sc->peer_uuid[1], sc->peer_uuid[2],
+		    sc->peer_uuid[3], f[28], f[29], f[30], f[31]);
+		memcpy(sc->peer_uuid, f + 28, 16);
+		/* new peer session: restart our side of the handshake */
+		sc->tbip_login_sent = false;
+		sc->login_tries = 0;
+		sc->login_last = 0;
+		sc->logout_kicks = 0;
+	}
 
 	switch (type) {
 	case NHI_TBIP_LOGIN:
 		/* req body: proto_version@hdr, transmit_path@hdr+4 */
 		if (len >= NHI_TBIP_HDR_LEN + 8)
 			sc->remote_tx_hopid = le32dec(f + NHI_TBIP_HDR_LEN + 4);
-		/* reply LOGIN_RESPONSE with our MAC (initiator=peer, target=us) */
+		/*
+		 * Reply LOGIN_RESPONSE with our MAC.  initiator = OUR uuid,
+		 * target = the peer - tbnet_login_response passes
+		 * (xd->local_uuid, xd->remote_uuid) and macOS validates
+		 * initiator==remote && target==local, silently dropping
+		 * anything else (we had these swapped: every response we ever
+		 * sent was discarded and the Mac retried login forever).
+		 */
 		total = NHI_TBIP_HDR_LEN + 4 + 8 + 4 + 16;	/* = 100 */
 		bzero(r, total);
 		tbip_hdr(sc, r, length_sn, NHI_TBIP_LOGIN_RESPONSE, command_id,
-		    sc->peer_uuid, sc->local_uuid, total);
+		    sc->local_uuid, sc->peer_uuid, total);
 		le32enc(r + NHI_TBIP_HDR_LEN + 0, 0);		/* status */
 		memcpy(r + NHI_TBIP_HDR_LEN + 4, sc->tbt_mac, 6);
 		le32enc(r + NHI_TBIP_HDR_LEN + 12, 6);	/* receiver_mac_len */
@@ -228,12 +295,41 @@ nhi_tbip_handle(struct nhi_softc *sc, const uint8_t *f, u_int len)
 		sc->tbip_login_sent = true;
 		device_printf(sc->dev, "tbip: LOGIN_RESPONSE peer mac %6D\n",
 		    sc->peer_mac, ":");
+		/*
+		 * Half-open: the peer answers our LOGIN but never sends its
+		 * own (it still holds a session from before we reloaded, so
+		 * we don't know its transmit_path).  Kick it with a LOGOUT -
+		 * it drops the stale session and re-LOGINs, giving us its
+		 * tx HopID.  Rate-limited to avoid a logout/response loop.
+		 */
+		if (!sc->tbip_login_received && sc->logout_kicks < 3) {
+			sc->logout_kicks++;
+			device_printf(sc->dev,
+			    "tbip: half-open (peer never logged in) - "
+			    "LOGOUT kick %u\n", sc->logout_kicks);
+			nhi_tbip_logout(sc);
+			sc->tbip_login_sent = false;
+			sc->login_tries = 0;
+			sc->login_last = 0;
+		}
 		break;
 	case NHI_TBIP_LOGOUT:
+		/* Ack with STATUS(0) - tbnet replies so the peer's logout
+		 * retries stop - then clear our session state.  Same uuid
+		 * direction as all tbnet frames: initiator=us, target=peer. */
+		total = NHI_TBIP_HDR_LEN + 4;
+		bzero(r, total);
+		tbip_hdr(sc, r, length_sn, NHI_TBIP_STATUS, command_id,
+		    sc->local_uuid, sc->peer_uuid, total);
+		le32enc(r + NHI_TBIP_HDR_LEN, 0);	/* status = ok */
+		nhi_ctl_tx(sc, NHI_PDF_XDOMAIN_RESP, r, total);
 		sc->tbip_login_sent = false;
 		sc->tbip_login_received = false;
-		device_printf(sc->dev, "tbip: LOGOUT\n");
+		sc->login_tries = 0;
+		device_printf(sc->dev, "tbip: LOGOUT -> STATUS ack\n");
 		break;
+	case NHI_TBIP_STATUS:
+		break;			/* peer acking our LOGOUT */
 	default:
 		device_printf(sc->dev, "tbip: type=%u len=%u\n", type, len);
 		break;

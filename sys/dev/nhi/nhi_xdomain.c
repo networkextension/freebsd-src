@@ -303,6 +303,31 @@ nhi_xdomain_handle(struct nhi_softc *sc, const uint8_t *f, u_int len)
 		/* req: hdr(32) + src_uuid(16)@32 + dst_uuid(16)@48 + offset@64 */
 		if (len < 68)
 			break;
+		/*
+		 * Bootstrap the session from the request itself when the ICM
+		 * never told us about the peer (frequent on integrated MTL
+		 * after a driver reload: no XDOMAIN_CONNECTED replay).  The
+		 * request carries src = the peer's UUID, dst = OUR UUID, and
+		 * came over the route we should answer on.  Without this our
+		 * responses carry a zero src UUID and macOS rejects them,
+		 * re-asking offset 0 forever.
+		 */
+		if (!sc->has_peer) {
+			memcpy(sc->peer_uuid, f + 32, 16);
+			memcpy(sc->local_uuid, f + 48, 16);
+			sc->peer_route_hi = rhi;
+			sc->peer_route_lo = rlo;
+			sc->local_route_hi = rhi;
+			sc->local_route_lo = rlo;
+			sc->has_peer = true;
+			nhi_tbip_init(sc);
+			nhi_xdomain_build_dir(sc);
+			device_printf(sc->dev, "xdomain: session bootstrapped "
+			    "from peer request (peer %02x%02x%02x%02x-..., "
+			    "local %02x%02x%02x%02x-..., route %x:%x)\n",
+			    f[32], f[33], f[34], f[35], f[48], f[49], f[50],
+			    f[51], rhi, rlo);
+		}
 		off = le32dec(f + 64) & 0xffff;	/* u16 offset (low half of the dword) */
 		rlen = xdp_props_response(sc, r, rhi, rlo, length_sn, f + 32, off);
 		nhi_ctl_tx(sc, NHI_PDF_XDOMAIN_RESP, r, rlen);
@@ -316,6 +341,8 @@ nhi_xdomain_handle(struct nhi_softc *sc, const uint8_t *f, u_int len)
 		nhi_ctl_tx(sc, NHI_PDF_XDOMAIN_RESP, r, XDP_HDR_LEN);
 		device_printf(sc->dev, "xdomain: PROPERTIES_CHANGED -> ack\n");
 		break;
+	case NHI_XDP_PROPERTIES_CHANGED_RESPONSE:
+		break;			/* peer acking OUR changed-notify */
 	default:
 		device_printf(sc->dev, "xdomain: unhandled type=%u len=%u\n",
 		    type, len);

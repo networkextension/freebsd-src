@@ -197,14 +197,47 @@ nhi_ring_program(struct nhi_ring *r)
 	nhi_write(sc, base + NHI_RING_PHYS + 4,
 	    (uint32_t)(r->desc_busaddr >> 32));
 
+	/*
+	 * Linux ring_start: frame-mode rings (tbnet data path) write max-frame
+	 * 0 (= 4096) and run without RAW, RX filtering by the PDF sof/eof
+	 * masks; non-frame rings (control ring 0) write the real frame size
+	 * and set RAW (ignore the masks).
+	 */
 	size = r->count & NHI_RING_SIZE_MASK;
-	if (!r->is_tx)
+	if (!r->is_tx && !r->frame_mode)
 		size |= (r->frame_size << NHI_RING_MAXFRAME_SHIFT);
 	nhi_write(sc, base + NHI_RING_SIZE, size);
 
-	nhi_write(sc, opt + NHI_RING_OPTS_MASK, 0);
-	nhi_write(sc, opt + NHI_RING_OPTS_FLAGS,
-	    NHI_RING_FLAG_ENABLE | NHI_RING_FLAG_RAW);
+	if (r->frame_mode) {
+		uint32_t flags = NHI_RING_FLAG_ENABLE;
+		uint32_t mask = 0;
+
+		if (!r->is_tx)
+			mask = ((uint32_t)r->sof_mask << 16) | r->eof_mask;
+		nhi_write(sc, opt + NHI_RING_OPTS_MASK, mask);
+		/* Step 1: set the ring valid/enable bit alone. */
+		nhi_write(sc, opt + NHI_RING_OPTS_FLAGS, flags);
+		/*
+		 * Step 2 (Linux tb_ring_start: "Now that the ring valid bit
+		 * is set we can configure E2E"): only AFTER the valid bit is
+		 * live may the E2E flow-control bits be set - writing them
+		 * together leaves E2E unarmed, no credits ever flow, and the
+		 * peer's (fully-E2E) transmitter never puts a frame on the
+		 * wire.  tbnet enables E2E on BOTH rings.
+		 */
+		if (r->e2e) {
+			if (!r->is_tx)
+				flags |= ((uint32_t)r->e2e_hop <<
+				    NHI_RX_OPTIONS_E2E_HOP_SHIFT) &
+				    NHI_RX_OPTIONS_E2E_HOP_MASK;
+			flags |= NHI_RING_FLAG_E2E;
+			nhi_write(sc, opt + NHI_RING_OPTS_FLAGS, flags);
+		}
+	} else {
+		nhi_write(sc, opt + NHI_RING_OPTS_MASK, 0);
+		nhi_write(sc, opt + NHI_RING_OPTS_FLAGS,
+		    NHI_RING_FLAG_ENABLE | NHI_RING_FLAG_RAW);
+	}
 }
 
 static void
@@ -432,8 +465,15 @@ nhi_ctl_rx(struct nhi_softc *sc, void *buf, u_int *len, uint8_t *pdf,
 			*len = ndw * 4;
 			*pdf = (d->attrs >> NHI_DESC_EOF_SHIFT) & 0xf;
 
-			/* re-post this slot and advance */
-			nhi_rx_desc_post(rx, slot);
+			/*
+			 * Re-post at HEAD (the rolling hole), NOT at the slot
+			 * just consumed (Linux ring_write_descriptors).  The
+			 * ring runs with count-1 posted and one hole; the hole
+			 * must roll forward or the HW fill pointer reaches the
+			 * never-posted slot and stalls forever - seen as "RX
+			 * goes deaf after ~15 frames" (one ring's worth).
+			 */
+			nhi_rx_desc_post(rx, rx->head);
 			bus_dmamap_sync(rx->buf_tag, rx->buf_map,
 			    BUS_DMASYNC_PREREAD);
 			rx->tail = (rx->tail + 1) % rx->count;
@@ -484,6 +524,16 @@ nhi_data_setup(struct nhi_softc *sc)
 		nhi_ring_free(tx);
 		return (error);
 	}
+
+	/* Frame mode (Linux RING_FLAG_FRAME): RX filters ThunderboltIP data
+	 * PDFs and runs E2E flow control fed by our TX ring (tbnet). */
+	tx->frame_mode = true;
+	tx->e2e = true;
+	rx->frame_mode = true;
+	rx->sof_mask = 1u << NHI_TBIP_PDF_FRAME_START;
+	rx->eof_mask = 1u << NHI_TBIP_PDF_FRAME_END;
+	rx->e2e = true;
+	rx->e2e_hop = NHI_DATA_TX_RING;
 
 	nhi_ring_program(tx);
 	nhi_ring_program(rx);
@@ -584,7 +634,10 @@ nhi_data_rx(struct nhi_softc *sc, void *buf, u_int *len)
 	memcpy(buf, src, framelen);
 	*len = framelen;
 
-	nhi_rx_desc_post(rx, slot);
+	/* Re-post at HEAD (rolling hole), not the consumed slot - same wrap
+	 * rule as ring 0 (see nhi_ctl_rx); otherwise the data RX ring goes
+	 * deaf after one ring's worth of frames. */
+	nhi_rx_desc_post(rx, rx->head);
 	bus_dmamap_sync(rx->buf_tag, rx->buf_map, BUS_DMASYNC_PREREAD);
 	rx->tail = (rx->tail + 1) % rx->count;
 	rx->head = (rx->head + 1) % rx->count;

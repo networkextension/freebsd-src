@@ -25,6 +25,8 @@
 #include <sys/mbuf.h>
 #include <sys/rman.h>
 #include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <sys/endian.h>
 #include <machine/bus.h>
 #include <machine/resource.h>
 
@@ -246,6 +248,140 @@ nhi_intr(void *arg)
 	wakeup(__DEVOLATILE(void *, &sc->event_run));	/* poke the RX event loop */
 }
 
+/* Sysctl trigger for the software replug: stash the level, poke the loop. */
+static int
+nhi_sysctl_reset(SYSCTL_HANDLER_ARGS)
+{
+	struct nhi_softc *sc = arg1;
+	int val = 0, error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val <= 0)
+		return (0);
+	sc->reset_req = arg2;	/* 1 = rescan, 2 = full reset */
+	wakeup(__DEVOLATILE(void *, &sc->event_run));
+	return (0);
+}
+
+/*
+ * Debug probe: read our own router's HOPS config space (Linux tb_msgs.h
+ * cfg_read_pkg: route(8B) + tb_cfg_address{offset:13,length:6,port:6,
+ * space:2,seq:2}) so we can SEE whether the ICM actually programmed the
+ * XDomain path entries (hop table entry N = 2 dwords at offset N*2).
+ * Responses (pdf=1 READ replies / pdf=3 errors) land in the event loop's
+ * default case and get hexdumped.
+ */
+static void
+nhi_dbg_hopdump(struct nhi_softc *sc)
+{
+	uint8_t req[12];
+	uint32_t addr, port;
+
+	static const u_int hops[] = { 1, 2, 8 };
+	u_int i;
+
+	for (port = 1; port <= 9; port++) {
+		for (i = 0; i < 3; i++) {
+			bzero(req, sizeof(req));  /* route 0 = our own router */
+			addr = ((hops[i] * 2) & 0x1fff) |  /* entry = hop*2 dw */
+			    (2u << 13) |		/* length: 2 dwords */
+			    (port << 19) |		/* adapter/port */
+			    (0u << 25) |		/* space 0 = HOPS */
+			    (1u << 27);			/* seq */
+			le32enc(req + 8, addr);
+			nhi_ctl_tx(sc, 1 /* TB_CFG_PKG_READ */, req,
+			    sizeof(req));
+			DELAY(5000);
+		}
+	}
+	device_printf(sc->dev, "hopdump: HOPS reads hops 1/2/8, ports 1-9\n");
+}
+
+/*
+ * Software "cable replug": re-arm the ICM without touching hardware cables.
+ * level 1 (rescan) re-issues DRIVER_READY - a healthy ICM replays its topology
+ * (DEVICE/XDOMAIN_CONNECTED) to the driver.  level 2 (reset) force-power
+ * cycles the whole controller first (integrated parts only), recovering the
+ * wedged-firmware state where events stop being raised entirely.  Runs in the
+ * event-loop thread so it never races the ring consumers.
+ */
+static void
+nhi_handle_reset(struct nhi_softc *sc, int level)
+{
+	if (level == 3) {		/* hopdump: read-only probe, no teardown */
+		nhi_dbg_hopdump(sc);
+		return;
+	}
+	if (level == 4) {		/* portdump: adapter types (PORT space) */
+		uint8_t req[12];
+		uint32_t addr, port;
+
+		for (port = 1; port <= 9; port++) {
+			bzero(req, sizeof(req));
+			addr = (2 & 0x1fff) |	/* dword 2 = adapter TYPE */
+			    (1u << 13) | (port << 19) |
+			    (1u << 25) |	/* space 1 = TB_CFG_PORT */
+			    (1u << 27);
+			le32enc(req + 8, addr);
+			nhi_ctl_tx(sc, 1, req, sizeof(req));
+			DELAY(5000);
+		}
+		device_printf(sc->dev, "portdump: PORT space dw2 (type), ports 1-9\n");
+		return;
+	}
+	if (level == 5) {
+		/*
+		 * pathfix: manually install the TX hop entry the ICM appears
+		 * to skip - NHI adapter (port 7) HOPS[ring 1] -> out_port 1
+		 * (lane), next_hop 8, styled after the fw-programmed RX entry
+		 * (port1 HOPS[8] = 0x801c3802 / 0x0180c501).  CFG_WRITE pkg =
+		 * route(8) + addr(4) + data dwords.
+		 */
+		uint8_t req[20];
+		uint32_t addr;
+
+		bzero(req, sizeof(req));
+		addr = (2 & 0x1fff) |		/* HOPS entry 1 (offset 1*2) */
+		    (2u << 13) | (7u << 19) |	/* len 2, port 7 (NHI) */
+		    (0u << 25) | (1u << 27);	/* space HOPS, seq */
+		le32enc(req + 8, addr);
+		/* dw0: next_hop=8 | out_port=1<<11 | credits=14<<17 | enable */
+		le32enc(req + 12, 8 | (1u << 11) | (14u << 17) | (1u << 31));
+		/* dw1: weight/priority/counters like the fw RX entry */
+		le32enc(req + 16, 0x0180c501);
+		nhi_ctl_tx(sc, 2 /* TB_CFG_PKG_WRITE */, req, sizeof(req));
+		device_printf(sc->dev, "pathfix: wrote NHI HOPS[1] -> port1 hop8\n");
+		return;
+	}
+	device_printf(sc->dev, "%s requested: tearing down session\n",
+	    level >= 2 ? "controller reset" : "rescan");
+	/* Fabric-level teardown FIRST so the peer sees the XDomain drop and
+	 * restarts its own discovery + login (else only our side is fresh). */
+	nhi_icm_disconnect_xdomain(sc);
+	nhi_tbt_disconnect(sc);
+	sc->has_peer = false;
+	if (level >= 2) {
+		if (!sc->force_power) {
+			device_printf(sc->dev,
+			    "reset: no force-power control on this part; "
+			    "doing rescan instead\n");
+		} else {
+			nhi_ring0_teardown(sc);
+			nhi_force_power(sc, false);
+			pause("nhirst", hz / 2);
+			if (nhi_force_power(sc, true) != 0 ||
+			    nhi_ring0_setup(sc) != 0) {
+				device_printf(sc->dev,
+				    "reset: controller did not come back\n");
+				return;
+			}
+		}
+	}
+	nhi_icm_driver_ready(sc);
+}
+
 /*
  * Ring-0 RX event loop: continuously reap control frames and dispatch by PDF -
  * ICM notifications (XDOMAIN_CONNECTED, ...) and XDomain discovery requests
@@ -260,6 +396,10 @@ nhi_event_loop(void *arg)
 	uint8_t pdf;
 
 	while (sc->event_run) {
+		if (sc->reset_req != 0) {
+			nhi_handle_reset(sc, sc->reset_req);
+			sc->reset_req = 0;
+		}
 		len = sizeof(frame);
 		if (nhi_ctl_rx(sc, frame, &len, &pdf, 0) == 0) {
 			switch (pdf) {
@@ -287,7 +427,14 @@ nhi_event_loop(void *arg)
 		if (sc->data_up)
 			nhi_tbt_rx_poll(sc);	/* drain the network RX ring */
 		nhi_tbip_start_login(sc);	/* active P2P: (re)send our LOGIN */
-		tsleep(__DEVOLATILE(void *, &sc->event_run), 0, "nhiev", hz / 20);
+		/*
+		 * MSI doesn't fire on 16.0-CURRENT (intr_count stays 0), so RX
+		 * is polling-driven.  50 ms ticks capped Mac->us at ~0.5 Mbit/s
+		 * (E2E credits also only returned once per tick).  Poll fast
+		 * while the data path is up; TODO: fix interrupts properly.
+		 */
+		tsleep(__DEVOLATILE(void *, &sc->event_run), 0, "nhiev",
+		    sc->data_up ? 1 : hz / 20);
 	}
 	sc->event_td = NULL;
 	wakeup(sc);
@@ -379,6 +526,29 @@ nhi_attach(device_t dev)
 		sc->event_td = NULL;
 		device_printf(dev, "failed to start ring-0 event loop\n");
 	}
+
+	/* Software "replug": dev.nhi.N.rescan / dev.nhi.N.reset (see
+	 * nhi_handle_reset).  Write 1 to trigger; runs in the event loop. */
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "rescan",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 1,
+	    nhi_sysctl_reset, "I", "re-issue DRIVER_READY (ICM replays topology)");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "reset",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 2,
+	    nhi_sysctl_reset, "I", "force-power cycle the controller + re-init");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "hopdump",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 3,
+	    nhi_sysctl_reset, "I", "debug: dump own router hop-8 path entries");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "portdump",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 4,
+	    nhi_sysctl_reset, "I", "debug: dump adapter types (PORT space)");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "pathfix",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 5,
+	    nhi_sysctl_reset, "I", "debug: manually install NHI TX hop entry");
 
 	return (0);
 }

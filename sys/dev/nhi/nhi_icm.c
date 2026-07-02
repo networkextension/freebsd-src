@@ -196,6 +196,108 @@ nhi_icm_handle_event(struct nhi_softc *sc, const uint8_t *f, u_int len)
 }
 
 /*
+ * ICM_DISCONNECT_XDOMAIN (0x11) - tear the XDomain link down at the FABRIC
+ * level, so the peer also sees the link drop and restarts its whole discovery
+ * + login state machine.  This is the piece that makes a software "replug"
+ * visible to the other side (our force-power reset alone only refreshes us).
+ * Linux icm_tr_xdomain_tear_down: 32-byte icm_tr_pkg_disconnect_xdomain
+ * { hdr(4); u8 stage; u8 rsvd[3]; u32 route_hi; u32 route_lo; uuid[16] },
+ * sent twice: stage 1, wait 10-50us, stage 2.
+ */
+static int
+nhi_icm_disconnect_stage(struct nhi_softc *sc, uint8_t stage)
+{
+	uint8_t req[32];
+	uint8_t resp[NHI_CTL_FRAME_SIZE];
+	uint8_t pdf;
+	u_int rlen;
+	int i;
+
+	bzero(req, sizeof(req));
+	req[0] = NHI_ICM_DISCONNECT_XDOMAIN;
+	req[4] = stage;
+	le32enc(req + 8, sc->peer_route_hi);
+	le32enc(req + 12, sc->peer_route_lo);
+	memcpy(req + 16, sc->peer_uuid, 16);
+	if (nhi_ctl_tx(sc, NHI_PDF_ICM_CMD, req, sizeof(req)) != 0)
+		return (EIO);
+	for (i = 0; i < 10; i++) {
+		rlen = sizeof(resp);
+		if (nhi_ctl_rx(sc, resp, &rlen, &pdf, 400) != 0)
+			break;
+		if (pdf == NHI_PDF_ICM_RESP &&
+		    resp[0] == NHI_ICM_DISCONNECT_XDOMAIN)
+			return ((resp[1] & 0x01) != 0 ? EIO : 0);
+	}
+	return (ETIMEDOUT);
+}
+
+int
+nhi_icm_disconnect_xdomain(struct nhi_softc *sc)
+{
+	int e1, e2;
+
+	if (!sc->has_peer)
+		return (0);
+	e1 = nhi_icm_disconnect_stage(sc, 1);
+	DELAY(50);
+	e2 = nhi_icm_disconnect_stage(sc, 2);
+	device_printf(sc->dev, "DISCONNECT_XDOMAIN: stage1=%d stage2=%d\n",
+	    e1, e2);
+	return (e1 != 0 ? e1 : e2);
+}
+
+/*
+ * Install the NHI-side TX hop entry the MTL ICM leaves empty: APPROVE
+ * programs the lane-side RX entry (lane HOPS[peer hopid] -> NHI ring, verified
+ * by config-space readback) but NOT the reverse one, so our TX frames -
+ * entering the router at the NHI adapter with HopID == ring number - hit an
+ * empty table and die inside our own router (and E2E credits never reach the
+ * peer either).  Write it ourselves via CFG_WRITE (this is the one SW-CM
+ * duty ICM mode still leaves us): NHI adapter HOPS[tx ring] -> out_port =
+ * first hop of the session route, next_hop = our announced TX HopID.  Entry
+ * style copied from the fw-programmed RX entry (credits 14, weight 1,
+ * priority 5, counters+ingress_fc bits = 0x0180c501).
+ */
+int
+nhi_install_tx_hop(struct nhi_softc *sc)
+{
+	uint8_t req[20];
+	uint8_t resp[NHI_CTL_FRAME_SIZE];
+	uint8_t pdf;
+	uint32_t addr;
+	u_int rlen, out_port, i;
+
+	out_port = sc->peer_route_lo & 0x3f;	/* first hop byte = lane port */
+	if (out_port == 0)
+		out_port = 1;
+	bzero(req, sizeof(req));
+	addr = ((NHI_DATA_TX_RING * 2) & 0x1fff) |	/* HOPS entry = ring */
+	    (2u << 13) |		/* 2 dwords */
+	    (7u << 19) |		/* MTL NHI adapter = port 7 (portdump) */
+	    (0u << 25) | (1u << 27);	/* space HOPS, seq */
+	le32enc(req + 8, addr);
+	le32enc(req + 12, (sc->local_tx_hopid & 0x7ff) | (out_port << 11) |
+	    (14u << 17) | (1u << 31));	/* next_hop | out_port | credits | EN */
+	le32enc(req + 16, 0x0180c501);
+	if (nhi_ctl_tx(sc, 2 /* TB_CFG_PKG_WRITE */, req, sizeof(req)) != 0)
+		return (EIO);
+	for (i = 0; i < 8; i++) {
+		rlen = sizeof(resp);
+		if (nhi_ctl_rx(sc, resp, &rlen, &pdf, 300) != 0)
+			break;
+		if (pdf == 2) {		/* write ack */
+			device_printf(sc->dev, "TX hop installed: NHI(7) "
+			    "HOPS[%d] -> port %u hop %u\n", NHI_DATA_TX_RING,
+			    out_port, sc->local_tx_hopid);
+			return (0);
+		}
+	}
+	device_printf(sc->dev, "TX hop install: no write ack\n");
+	return (ETIMEDOUT);
+}
+
+/*
  * APPROVE_XDOMAIN_PATHS - set up the bidirectional DMA tunnel for the network
  * service (Linux icm.c, TR variant for integrated controllers).  We chose the
  * NHI ring indices and HopIDs already: our TX HopID + data TX ring, and the
@@ -260,8 +362,17 @@ matched:
 		    "APPROVE_XDOMAIN rejected (flags=0x%02x)\n", flags);
 		return (EIO);
 	}
-	device_printf(sc->dev, "APPROVE_XDOMAIN ok: tx hop %u ring %d, "
-	    "rx hop %u ring %d\n", sc->local_tx_hopid, NHI_DATA_TX_RING,
+	/*
+	 * Parse the echoed fields - the fw may return the hopids/rings it
+	 * ACTUALLY programmed (we previously ignored everything but the code).
+	 */
+	device_printf(sc->dev, "APPROVE_XDOMAIN ok: reply len=%u route %x:%x "
+	    "tx_path=%u tx_ring=%u rx_path=%u rx_ring=%u (we asked tx %u/%d "
+	    "rx %u/%d)\n", rlen,
+	    le32dec(resp + 4), le32dec(resp + 8),
+	    le16dec(resp + 28), le16dec(resp + 30),
+	    le16dec(resp + 32), le16dec(resp + 34),
+	    sc->local_tx_hopid, NHI_DATA_TX_RING,
 	    sc->remote_tx_hopid, NHI_DATA_RX_RING);
 	return (0);
 }

@@ -30,6 +30,7 @@
 #include <net/if_var.h>
 #include <net/if_types.h>
 #include <net/ethernet.h>
+#include <net/vnet.h>
 
 #include <dev/pci/pcivar.h>
 
@@ -72,6 +73,9 @@ nhi_tbt_connect(struct nhi_softc *sc)
 		nhi_data_teardown(sc);
 		return (error);
 	}
+	/* The MTL ICM approves but leaves the NHI-side TX hop empty - our
+	 * frames died inside our own router until this is written. */
+	nhi_install_tx_hop(sc);
 
 	if (sc->ifp == NULL) {
 		mtx_init(&sc->tbt_lock, "tbt", NULL, MTX_DEF);
@@ -85,7 +89,14 @@ nhi_tbt_connect(struct nhi_softc *sc)
 		if_setqflushfn(ifp, tbt_qflush);
 		if_setinitfn(ifp, tbt_init);
 		if_setioctlfn(ifp, tbt_ioctl);
+		/*
+		 * We run in the ring-0 event-loop kthread, which has no vnet
+		 * context; if_attach_internal dereferences curvnet (VIMAGE is
+		 * on in GENERIC) and panics without this.
+		 */
+		CURVNET_SET(vnet0);
 		ether_ifattach(ifp, sc->tbt_mac);
+		CURVNET_RESTORE();
 		device_printf(sc->dev, "tbt%d: attached, mac %6D peer %6D\n",
 		    device_get_unit(sc->dev), sc->tbt_mac, ":", sc->peer_mac, ":");
 	}
@@ -109,6 +120,7 @@ nhi_tbt_disconnect(struct nhi_softc *sc)
 	sc->tbip_login_received = false;
 	sc->login_last = 0;
 	sc->login_tries = 0;
+	sc->logout_kicks = 0;
 	sc->paths_approved = false;
 
 	if (sc->ifp != NULL) {
@@ -208,8 +220,9 @@ tbt_frame_ok(u_int len, u_int fsize, u_int count)
 	return (true);
 }
 
-/* Reassemble multi-frame packets; deliver on the last fragment. */
-static void
+/* Reassemble multi-frame packets; RETURNS the completed packet (caller
+ * if_input()s it after dropping tbt_lock) or NULL while incomplete. */
+static struct mbuf *
 tbt_reass(struct nhi_softc *sc, const uint8_t *payload, u_int len,
     u_int index, uint16_t id, u_int count)
 {
@@ -221,7 +234,7 @@ tbt_reass(struct nhi_softc *sc, const uint8_t *payload, u_int len,
 		sc->rx_m = m_gethdr(M_NOWAIT, MT_DATA);
 		if (sc->rx_m == NULL) {
 			if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
-			return;
+			return (NULL);
 		}
 		sc->rx_m->m_pkthdr.len = 0;
 		sc->rx_m->m_len = 0;
@@ -233,22 +246,21 @@ tbt_reass(struct nhi_softc *sc, const uint8_t *payload, u_int len,
 	    index != sc->rx_index) {
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		tbt_reass_reset(sc);
-		return;
+		return (NULL);
 	}
 	if (m_append(sc->rx_m, len, (const char *)payload) == 0) {
 		if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
 		tbt_reass_reset(sc);
-		return;
+		return (NULL);
 	}
 	sc->rx_index++;
 	if (sc->rx_index == sc->rx_count) {
 		m = sc->rx_m;
 		sc->rx_m = NULL;
 		sc->rx_count = 0;
-		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
-		if_inc_counter(ifp, IFCOUNTER_IBYTES, m->m_pkthdr.len);
-		if_input(ifp, m);
+		return (m);
 	}
+	return (NULL);
 }
 
 /*
@@ -260,6 +272,7 @@ void
 nhi_tbt_rx_poll(struct nhi_softc *sc)
 {
 	uint8_t frame[NHI_DATA_FRAME_SIZE];
+	struct epoch_tracker et;
 	if_t ifp = sc->ifp;
 	const uint8_t *payload;
 	struct mbuf *m;
@@ -269,17 +282,30 @@ nhi_tbt_rx_poll(struct nhi_softc *sc)
 	if (!sc->data_up || ifp == NULL)
 		return;
 
-	mtx_lock(&sc->tbt_lock);
+	/* if_input() must run inside the network epoch; we're a plain kthread
+	 * (driver ithreads get this implicitly, we don't). */
+	NET_EPOCH_ENTER(et);
 	for (;;) {
+		/*
+		 * Take tbt_lock only for ring/reassembly work and DROP it
+		 * before if_input(): the stack may transmit synchronously from
+		 * input (e.g. the ARP reply), and tbt_transmit takes the same
+		 * lock - holding it across if_input recursed and panicked the
+		 * moment the first real frame arrived (if_tbt.c:162).
+		 */
+		mtx_lock(&sc->tbt_lock);
 		len = sizeof(frame);
-		if (nhi_data_rx(sc, frame, &len) != 0)
+		if (nhi_data_rx(sc, frame, &len) != 0) {
+			mtx_unlock(&sc->tbt_lock);
 			break;			/* ring empty */
+		}
 
 		fsize = le32dec(frame + NHI_TBIP_FRAME_OFF_SIZE);
 		index = le16dec(frame + NHI_TBIP_FRAME_OFF_INDEX);
 		id = le16dec(frame + NHI_TBIP_FRAME_OFF_ID);
 		count = le32dec(frame + NHI_TBIP_FRAME_OFF_COUNT);
 		if (!tbt_frame_ok(len, fsize, count)) {
+			mtx_unlock(&sc->tbt_lock);
 			if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 			continue;
 		}
@@ -288,6 +314,7 @@ nhi_tbt_rx_poll(struct nhi_softc *sc)
 		if (count == 1) {		/* fast path: whole packet, one frame */
 			m = m_devget(__DECONST(char *, payload), fsize, 0,
 			    ifp, NULL);
+			mtx_unlock(&sc->tbt_lock);
 			if (m == NULL) {
 				if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
 				continue;
@@ -297,7 +324,13 @@ nhi_tbt_rx_poll(struct nhi_softc *sc)
 			if_input(ifp, m);
 			continue;
 		}
-		tbt_reass(sc, payload, fsize, index, id, count);
+		m = tbt_reass(sc, payload, fsize, index, id, count);
+		mtx_unlock(&sc->tbt_lock);
+		if (m != NULL) {
+			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+			if_inc_counter(ifp, IFCOUNTER_IBYTES, m->m_pkthdr.len);
+			if_input(ifp, m);
+		}
 	}
-	mtx_unlock(&sc->tbt_lock);
+	NET_EPOCH_EXIT(et);
 }
