@@ -321,9 +321,20 @@ nhi_ring0_setup(struct nhi_softc *sc)
 		return (error);
 	}
 
-	/* Intel: auto-clear ring interrupt status on read. */
+	/*
+	 * Disable HW auto-clear; we clear NOTIFY status explicitly via
+	 * INT_CLEAR in nhi_ring0_intr.  VERIFY (intrdump): on MTL the HW
+	 * auto-clear bit did NOT reset the status/edge latch - status bits
+	 * accumulated (0x01001001 after 270 frames) and the edge-triggered
+	 * MSI stopped firing after the very first 0->1 transition (270 CFG
+	 * round-trips produced 1 interrupt).  Linux only sets the HW
+	 * auto-clear bit in the MSI-X path; the legacy/single-MSI path clears
+	 * explicitly (nhi_clear_interrupt: iowrite32(~0, REG_RING_INT_CLEAR)).
+	 */
 	misc = nhi_read(sc, NHI_REG_DMA_MISC);
-	nhi_write(sc, NHI_REG_DMA_MISC, misc | NHI_DMA_MISC_INT_AUTO_CLEAR);
+	misc &= ~NHI_DMA_MISC_INT_AUTO_CLEAR;
+	misc |= NHI_DMA_MISC_DISABLE_AUTO_CLEAR;
+	nhi_write(sc, NHI_REG_DMA_MISC, misc);
 
 	nhi_ring_program(tx);
 	nhi_ring_program(rx);
@@ -493,7 +504,18 @@ void
 nhi_ring0_intr(struct nhi_softc *sc)
 {
 	sc->intr_count++;
-	(void)nhi_read(sc, NHI_REG_RING_NOTIFY_BASE);	/* auto-clears */
+	/*
+	 * NOTIFY status is level, MSI is edge.  Explicitly write INT_CLEAR to
+	 * reset the status bits and re-arm the next 0->1 edge (Linux
+	 * nhi_clear_interrupt non-auto-clear path: iowrite32(~0,
+	 * REG_RING_INT_CLEAR + ring)).  Read-to-clear alone did NOT reset the
+	 * edge latch on MTL (see nhi_ring0_setup).  hop_count=12 => all our
+	 * ring status bits (TX/RX/overflow, max bit 26) fit dword0, but clear
+	 * dword1 too for safety on higher hop counts.
+	 */
+	(void)nhi_read(sc, NHI_REG_RING_NOTIFY_BASE);
+	nhi_write(sc, NHI_REG_RING_INT_CLEAR, ~0U);
+	nhi_write(sc, NHI_REG_RING_INT_CLEAR + 4, ~0U);
 }
 
 /*

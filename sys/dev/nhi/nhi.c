@@ -325,6 +325,45 @@ nhi_dbg_credits(struct nhi_softc *sc)
 }
 
 /*
+ * Debug probe (dev.nhi.N.intrdump=1): snapshot the whole MSI/interrupt
+ * routing block so we can SEE why the MSI fires only once.  Static analysis
+ * says our device programming matches Linux nhi.c; the open question is the
+ * delivery/routing layer.  Prime suspect: on MTL (MSI-X native) we fell back
+ * to single MSI and never program REG_INT_VEC_ALLOC, so ring interrupts may
+ * not be routed to our vector.  This reads (does NOT change) the state.
+ */
+static void
+nhi_dbg_intrdump(struct nhi_softc *sc)
+{
+	uint32_t v0, v1, i;
+
+	v0 = nhi_read(sc, NHI_REG_RING_INT_BASE);
+	v1 = nhi_read(sc, NHI_REG_RING_INT_BASE + 4);
+	device_printf(sc->dev, "intrdump: RING_INT (enable) +0=0x%08x +4=0x%08x\n",
+	    v0, v1);
+
+	v0 = nhi_read(sc, NHI_REG_RING_NOTIFY_BASE);
+	v1 = nhi_read(sc, NHI_REG_RING_NOTIFY_BASE + 4);
+	device_printf(sc->dev, "intrdump: NOTIFY (status) +0=0x%08x +4=0x%08x "
+	    "(read clears)\n", v0, v1);
+
+	/* IVR: 8 rings x 4 bits per 32-bit reg; hop_count=12 spans regs 0..2. */
+	for (i = 0; i < NHI_INT_VEC_ALLOC_REGS; i++) {
+		v0 = nhi_read(sc, NHI_REG_INT_VEC_ALLOC_BASE + i * 4);
+		device_printf(sc->dev, "intrdump: IVR[%u] (0x%x) = 0x%08x\n",
+		    i, NHI_REG_INT_VEC_ALLOC_BASE + i * 4, v0);
+	}
+
+	v0 = nhi_read(sc, NHI_REG_INT_THROTTLE);
+	device_printf(sc->dev, "intrdump: THROTTLE[0] = 0x%08x\n", v0);
+	v0 = nhi_read(sc, NHI_REG_DMA_MISC);
+	device_printf(sc->dev, "intrdump: DMA_MISC = 0x%08x (auto_clear bit2=%u)\n",
+	    v0, (v0 >> 2) & 1);
+	device_printf(sc->dev, "intrdump: sc->intr_count=%u (vmstat should agree)\n",
+	    sc->intr_count);
+}
+
+/*
  * Software "cable replug": re-arm the ICM without touching hardware cables.
  * level 1 (rescan) re-issues DRIVER_READY - a healthy ICM replays its topology
  * (DEVICE/XDOMAIN_CONNECTED) to the driver.  level 2 (reset) force-power
@@ -358,6 +397,10 @@ nhi_handle_reset(struct nhi_softc *sc, int level)
 	}
 	if (level == 6) {
 		nhi_dbg_credits(sc);
+		return;
+	}
+	if (level == 7) {		/* intrdump: MSI/IVR routing snapshot */
+		nhi_dbg_intrdump(sc);
 		return;
 	}
 	if (level == 5) {
@@ -591,6 +634,10 @@ nhi_attach(device_t dev)
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "credits",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 6,
 	    nhi_sysctl_reset, "I", "debug: bump lane RX path credits 14 -> 64");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "intrdump",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 7,
+	    nhi_sysctl_reset, "I", "debug: snapshot MSI/IVR interrupt routing");
 
 	return (0);
 }
