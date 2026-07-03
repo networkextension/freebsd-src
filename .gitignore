@@ -10,3 +10,19 @@ machine
 *_if.h
 export_syms
 .tmp_*
+
+# Apple kernel collection RE inputs (large; not redistributable)
+*.kc
+*.kc_*
+BootKernelCollection.kc
+prelink-info.plist
+*.a2s
+# Extracted Apple kext binaries - our notes (README/TB5-notes) are kept, binaries are not
+reference/apple-kext/**/*.macho
+# Verbatim in-tree FreeBSD driver copy (regenerable via rsync); keep only our README
+reference/freebsd-thunderbolt-intree/*.c
+reference/freebsd-thunderbolt-intree/*.h
+reference/freebsd-thunderbolt-intree/*.m
+
+# Session-local Claude Code config
+.claude/
