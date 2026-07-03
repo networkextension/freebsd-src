@@ -294,6 +294,15 @@ nhi_ring_int_enable(struct nhi_ring *r, bool enable)
 	else
 		val &= ~(1u << (bit % 32));
 	nhi_write(sc, reg, val);
+
+	/* Track the wanted mask so nhi_intr_unmask can restore it after the
+	 * handler masks everything (hop_count=12 -> all bits in dword0). */
+	if (bit < 32) {
+		if (enable)
+			sc->int_mask |= (1u << bit);
+		else
+			sc->int_mask &= ~(1u << bit);
+	}
 }
 
 /*
@@ -322,19 +331,24 @@ nhi_ring0_setup(struct nhi_softc *sc)
 	}
 
 	/*
-	 * Disable HW auto-clear; we clear NOTIFY status explicitly via
-	 * INT_CLEAR in nhi_ring0_intr.  VERIFY (intrdump): on MTL the HW
-	 * auto-clear bit did NOT reset the status/edge latch - status bits
-	 * accumulated (0x01001001 after 270 frames) and the edge-triggered
-	 * MSI stopped firing after the very first 0->1 transition (270 CFG
-	 * round-trips produced 1 interrupt).  Linux only sets the HW
-	 * auto-clear bit in the MSI-X path; the legacy/single-MSI path clears
-	 * explicitly (nhi_clear_interrupt: iowrite32(~0, REG_RING_INT_CLEAR)).
+	 * Intel auto-clear quirk ON (Linux QUIRK_AUTO_CLEAR_INT, set for all
+	 * Intel routers): NOTIFY status clears on read.  Note Apple's driver
+	 * touches neither this nor any INT_CLEAR register - it relies purely
+	 * on drain-to-deassert level semantics (RE-AppleThunderboltNHI.md
+	 * section 4); the interrupt re-arm strategy here is mask-in-handler +
+	 * unmask-after-drain, see nhi_ring0_intr/nhi_intr_unmask.
 	 */
 	misc = nhi_read(sc, NHI_REG_DMA_MISC);
-	misc &= ~NHI_DMA_MISC_INT_AUTO_CLEAR;
-	misc |= NHI_DMA_MISC_DISABLE_AUTO_CLEAR;
-	nhi_write(sc, NHI_REG_DMA_MISC, misc);
+	misc &= ~NHI_DMA_MISC_DISABLE_AUTO_CLEAR;
+	nhi_write(sc, NHI_REG_DMA_MISC, misc | NHI_DMA_MISC_INT_AUTO_CLEAR);
+
+	/*
+	 * Program the interrupt throttle for vector 0 - BOTH Linux
+	 * (ring_interrupt_active: 128us in 256ns units) and Apple (initNHI
+	 * writes 0x38c00 from an ivar) initialise this; we found it at reset
+	 * value 0 (intrdump).  128us / 256ns = 500 = 0x1f4.
+	 */
+	nhi_write(sc, NHI_REG_INT_THROTTLE, 500 & NHI_INT_THROTTLE_INTERVAL_MASK);
 
 	nhi_ring_program(tx);
 	nhi_ring_program(rx);
@@ -505,17 +519,32 @@ nhi_ring0_intr(struct nhi_softc *sc)
 {
 	sc->intr_count++;
 	/*
-	 * NOTIFY status is level, MSI is edge.  Explicitly write INT_CLEAR to
-	 * reset the status bits and re-arm the next 0->1 edge (Linux
-	 * nhi_clear_interrupt non-auto-clear path: iowrite32(~0,
-	 * REG_RING_INT_CLEAR + ring)).  Read-to-clear alone did NOT reset the
-	 * edge latch on MTL (see nhi_ring0_setup).  hop_count=12 => all our
-	 * ring status bits (TX/RX/overflow, max bit 26) fit dword0, but clear
-	 * dword1 too for safety on higher hop counts.
+	 * Apple-corroborated semantics (kext/Max/RE-AppleThunderboltNHI.md
+	 * section 4): macOS NEVER writes an interrupt clear - ring-notify is
+	 * level, deasserted implicitly by draining ring descriptors.  An
+	 * INT_CLEAR-style write re-arms the edge while the level is still
+	 * asserted -> instant re-fire -> interrupt storm (the previous
+	 * revision did exactly that and took the box down on load).
+	 *
+	 * Storm-proof pattern (Linux __ring_interrupt start_poll path): read
+	 * NOTIFY once (Intel auto-clear quirk clears on read), MASK our ring
+	 * interrupts, and let the event loop drain everything; the loop
+	 * unmasks when done (nhi_intr_unmask).  If more work arrived while
+	 * masked, the still-asserted level produces a fresh edge on unmask -
+	 * nothing is lost, and re-fire is bounded to one per drain pass.
 	 */
 	(void)nhi_read(sc, NHI_REG_RING_NOTIFY_BASE);
-	nhi_write(sc, NHI_REG_RING_INT_CLEAR, ~0U);
-	nhi_write(sc, NHI_REG_RING_INT_CLEAR + 4, ~0U);
+	nhi_write(sc, NHI_REG_RING_INT_BASE, 0);
+}
+
+/* Re-enable (unmask) whatever rings asked for interrupts; event loop calls
+ * this after a full drain pass. */
+void
+nhi_intr_unmask(struct nhi_softc *sc)
+{
+	if (sc->int_mask != 0 &&
+	    nhi_read(sc, NHI_REG_RING_INT_BASE) != sc->int_mask)
+		nhi_write(sc, NHI_REG_RING_INT_BASE, sc->int_mask);
 }
 
 /*

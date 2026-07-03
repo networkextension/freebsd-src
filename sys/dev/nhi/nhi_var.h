@@ -80,6 +80,9 @@ struct nhi_softc {
 	struct nhi_ring		ring0_rx;
 	bool			ring0_up;
 	uint32_t		intr_count;	/* ISR invocations (debug) */
+	uint32_t		int_mask;	/* wanted RING_INT dword0 bits;
+						 * ISR masks all, event loop
+						 * restores (nhi_intr_unmask) */
 
 	/* Ring-0 RX event loop (nhi_event_loop). */
 	struct thread		*event_td;
@@ -144,6 +147,7 @@ int		nhi_ctl_tx(struct nhi_softc *sc, uint8_t pdf, const void *data,
 int		nhi_ctl_rx(struct nhi_softc *sc, void *buf, u_int *len,
 		    uint8_t *pdf, int timeout_ms);
 void		nhi_ring0_intr(struct nhi_softc *sc);
+void		nhi_intr_unmask(struct nhi_softc *sc);
 
 /* nhi_icm.c - ICM DRIVER_READY handshake (TP-1b / the ICM gate). */
 int		nhi_icm_driver_ready(struct nhi_softc *sc);

@@ -500,6 +500,12 @@ nhi_event_loop(void *arg)
 			nhi_tbt_rx_poll(sc);	/* drain the network RX ring */
 		nhi_tbip_start_login(sc);	/* active P2P: (re)send our LOGIN */
 		/*
+		 * Everything drained: unmask ring interrupts (the ISR masked
+		 * them all).  If new work raced in, the still-asserted level
+		 * yields a fresh MSI edge on unmask - nothing lost.
+		 */
+		nhi_intr_unmask(sc);
+		/*
 		 * MSI doesn't fire on 16.0-CURRENT (intr_count stays 0), so RX
 		 * is polling-driven and the poll rate IS the throughput
 		 * ceiling (the peer's E2E window refills once per drain).
