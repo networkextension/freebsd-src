@@ -76,6 +76,19 @@ static void nhi_fill_rx_ring(struct nhi_softc *, struct nhi_ring_pair *);
 static void nhi_ring_process(struct nhi_ring_pair *);
 static void nhi_rxpoll_timer(void *);
 static int nhi_init(struct nhi_softc *);
+
+/*
+ * Data-ring RX poll interval, in microseconds.  Apple's NHI runs a
+ * self-re-arming IOTimerEventSource at a tunable interval (tbpollinterval,
+ * default 1000us) and batch-drains the ring each fire.  We are poll-only here
+ * (per-ring MSI-X is unreliable on this hardware), so we mirror that model but
+ * default lower and use callout_reset_sbt for sub-ms resolution (a plain
+ * callout is tick-granular, ~1ms, which rate-limits sustained RX/E2E credit
+ * return).  Tunable: hw.nhi.rxpoll_us.
+ */
+static int nhi_rxpoll_us = 250;
+SYSCTL_INT(_hw, OID_AUTO, nhi_rxpoll_us, CTLFLAG_RWTUN, &nhi_rxpoll_us, 0,
+    "Thunderbolt NHI data-ring RX poll interval (microseconds)");
 static void nhi_post_init(void *);
 static int nhi_tx_enqueue(struct nhi_ring_pair *, struct nhi_cmd_frame *);
 static int nhi_setup_sysctl(struct nhi_softc *);
@@ -963,7 +976,8 @@ nhi_ring_start(struct nhi_ring_pair *r)
 	 */
 	if (r->ring_num != 0) {
 		r->rxpoll_active = true;
-		callout_reset(&r->rxpoll_co, 1, nhi_rxpoll_timer, r);
+		callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
+	    nhi_rxpoll_timer, r, C_PREL(2));
 		tb_debug(sc, DBG_INIT, "ring%d serviced by poll\n", r->ring_num);
 	}
 	return (0);
@@ -1354,6 +1368,8 @@ nhi_ring_process(struct nhi_ring_pair *r)
 	struct nhi_cmd_frame *cmd;
 	struct nhi_softc *sc = r->sc;
 	struct nhi_tx_buffer_desc *txd;
+	struct nhi_rx_buffer_desc *hd;
+	struct nhi_cmd_frame *hcmd;
 	uint32_t val, old_ci;
 	u_int count;
 
@@ -1370,8 +1386,14 @@ nhi_ring_process(struct nhi_ring_pair *r)
 		tb_debug(sc, DBG_INTR|DBG_TXQ|DBG_FULL,
 		    "Found tx cmdidx= %d cmd= %p\n", r->tx_ci, cmd);
 
-		/* Pass the completion up the stack */
-		nhi_tx_complete(r, txd, cmd);
+		/*
+		 * Pass the completion up the stack.  cmd is NULL for a TX slot
+		 * we never submitted to (e.g. the RX ring's unused TX side, which
+		 * the poll still scans) - a stray/garbage DONE bit there would
+		 * otherwise deref a NULL cmd in nhi_tx_complete.
+		 */
+		if (cmd != NULL)
+			nhi_tx_complete(r, txd, cmd);
 
 		/*
 		 * Advance to the next item in the ring via the cached
@@ -1408,21 +1430,44 @@ nhi_ring_process(struct nhi_ring_pair *r)
 		/*
 		 * Pass the RX frame up the stack.  RX frames are re-used
 		 * in-place, so their contents must be copied before this
-		 * function returns.
+		 * function returns.  Guard against a NULL cmd (unbacked slot /
+		 * stale index): nhi_rx_complete dereferences cmd immediately.
 		 *
 		 * XXX Rings other than Ring0 might want to have a different
 		 * re-use and re-populate policy
 		 */
-		nhi_rx_complete(r, &rxd->rxpost, cmd);
+		if (cmd != NULL)
+			nhi_rx_complete(r, &rxd->rxpost, cmd);
 
 		/*
-		 * Advance the CI and move forward to the next item in the
-		 * ring via our cached copy of the PI.  Clear out the
-		 * length field so we can detect a new RX frame when the
-		 * ring wraps around.  Reset the flags of the descriptor.
+		 * Clear the consumed slot's length so we can detect a new frame
+		 * when the ring wraps, then re-post an empty buffer.
 		 */
 		rxd->rxpost.eof_len = 0;
-		rxd->rx.flags = RX_BUFFER_DESC_RS | RX_BUFFER_DESC_IE;
+		if (r->frame_mode) {
+			/*
+			 * FRAME-mode data ring: re-post at HEAD (rx_ci), one
+			 * slot behind the tail (rx_pi) just consumed, so exactly
+			 * one hole rolls forward.  Ring 0's in-place re-post
+			 * (else branch) leaves no hole, and the fabric fill
+			 * pointer stalls after one ring's worth - "RX goes deaf"
+			 * (the standalone driver's hard-won rule).  The buffer
+			 * address survives the HW fill (it overwrites only the
+			 * eof_len/flags at offset >=8), but re-set it defensively.
+			 */
+			hd = &r->rx_ring[r->rx_ci].rx;
+			hcmd = r->rx_cmd_ring[r->rx_ci];
+			if (hcmd != NULL) {
+				hd->addr_lo = hcmd->data_busaddr & 0xffffffff;
+				hd->addr_hi =
+				    (hcmd->data_busaddr >> 32) & 0xffffffff;
+				hd->offset = 0;
+				hd->flags = RX_BUFFER_DESC_RS |
+				    RX_BUFFER_DESC_IE;
+			}
+		} else {
+			rxd->rx.flags = RX_BUFFER_DESC_RS | RX_BUFFER_DESC_IE;
+		}
 		r->rx_ci = (r->rx_ci + 1) & r->rx_ring_mask;
 		r->rx_pi = (r->rx_pi + 1) & r->rx_ring_mask;
 	}
@@ -1436,7 +1481,17 @@ nhi_ring_process(struct nhi_ring_pair *r)
 	 * interrupt?
 	 */
 	if (r->rx_ci != old_ci) {
-		val = r->rx_pi << RX_RING_PI_SHIFT | r->rx_ci;
+		/*
+		 * FRAME-mode data ring: advertise only HEAD (rx_ci) in the CI
+		 * field, matching the proven data-ring path.  Writing the
+		 * consumer (rx_pi) into the PI field can gate the fabric
+		 * producer to the tail and starve RX credits.  Ring 0 keeps the
+		 * combined PI|CI write it was validated with.
+		 */
+		if (r->frame_mode)
+			val = r->rx_ci & RX_RING_CI_MASK;
+		else
+			val = r->rx_pi << RX_RING_PI_SHIFT | r->rx_ci;
 		tb_debug(sc, DBG_INTR | DBG_RXQ,
 		    "Writing new RX PICI= 0x%08x\n", val);
 		nhi_write_reg(sc, r->rx_pici_reg, val);
@@ -1458,7 +1513,8 @@ nhi_rxpoll_timer(void *arg)
 	if (!r->rxpoll_active)
 		return;
 	nhi_ring_process(r);
-	callout_reset(&r->rxpoll_co, 1, nhi_rxpoll_timer, r);
+	callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
+	    nhi_rxpoll_timer, r, C_PREL(2));
 }
 
 void
