@@ -76,7 +76,8 @@
 #define	XDP_LENGTH_MASK	0x0000003f
 #define	XDP_SN_MASK	0x18000000
 
-#define	ICM_DATA_TX_RING	1	/* our if_tbt local ring number */
+#define	ICM_DATA_TX_RING	1	/* if_tbt local TX ring (must match if_tbt.c) */
+#define	ICM_DATA_RX_RING	2	/* if_tbt local RX ring (separate for E2E) */
 #define	ICM_FRAME_SIZE		256
 
 static const uint8_t tbip_svc_uuid[16] = TBIP_SVC_UUID;
@@ -258,7 +259,7 @@ tb_icm_approve_xdomain(struct tb_icm *icm)
 	le16enc(req + 28, (uint16_t)icm->local_tx_hopid);	/* transmit_path */
 	le16enc(req + 30, ICM_DATA_TX_RING);			/* transmit_ring */
 	le16enc(req + 32, (uint16_t)icm->remote_tx_hopid);	/* receive_path */
-	le16enc(req + 34, ICM_DATA_TX_RING);			/* receive_ring */
+	le16enc(req + 34, ICM_DATA_RX_RING);			/* receive_ring */
 
 	error = tb_icm_request(icm, ICM_APPROVE_XDOMAIN, req, sizeof(req),
 	    resp, &rlen, 400);

@@ -51,7 +51,8 @@
  * data frame is a 12-byte little-endian header + up to TBNET_MAX_PAYLOAD bytes;
  * one Ethernet frame is split across frame_count frames keyed by frame_id.
  */
-#define	TBNET_DATA_RING		1	/* our local NHI ring number for the pair */
+#define	TBNET_DATA_TX_RING	1	/* local NHI ring: our TX (frame_mode + E2E) */
+#define	TBNET_DATA_RX_RING	2	/* local NHI ring: our RX; E2E credits feed via the TX ring */
 #define	TBNET_RING_DEPTH	1024
 #define	TBNET_FRAME_SIZE	4096
 #define	TBNET_HDR_LEN		12
@@ -66,7 +67,8 @@
 struct tbnet_softc {
 	struct nhi_softc	*nsc;		/* the transport */
 	if_t			ifp;
-	struct nhi_ring_pair	*ring;		/* FRAME-mode data ring pair */
+	struct nhi_ring_pair	*txring;	/* FRAME-mode TX ring (hop -> peer) */
+	struct nhi_ring_pair	*rxring;	/* FRAME-mode RX ring (E2E -> txring) */
 	struct mtx		lock;
 
 	uint8_t			mac[ETHER_ADDR_LEN];
@@ -124,37 +126,46 @@ tbnet_attach(struct nhi_softc *nsc, const uint8_t *mac, const uint8_t *peer_mac,
 	mtx_init(&ts->lock, "tbnet", NULL, MTX_DEF);
 
 	/*
-	 * One FRAME-mode, E2E ring pair.  Unlike nhi_icm (which used separate
-	 * NHI rings for TX hop 1 and RX hop 2), the in-tree transport bundles
-	 * TX+RX per ring number, so we use a single bidirectional pair and pair
-	 * its RX E2E credit with its own TX hop.  Local ring numbers are not
-	 * visible to the peer; only the fabric paths (from login) are.  The
-	 * connection manager's APPROVE must therefore use this ring number for
-	 * both transmit_ring and receive_ring.
+	 * Two FRAME-mode, E2E rings, matching the proven ThunderboltIP data
+	 * path: a TX ring (our frames -> peer) and a *separate* RX ring.  E2E
+	 * flow control needs them distinct - the RX ring's credits are emitted
+	 * on the TX ring (e2e_hopid = the TX ring), so a single bidirectional
+	 * ring never sources credits and the peer's fully-E2E transmitter never
+	 * puts a frame on the wire (observed as RX = 0).  Local ring numbers are
+	 * not visible to the peer; the connection manager's APPROVE maps the
+	 * fabric paths onto transmit_ring = TX ring, receive_ring = RX ring.
 	 */
 	memset(&opts, 0, sizeof(opts));
 	opts.frame_size = TBNET_FRAME_SIZE;
 	opts.frame_mode = 1;
 	opts.e2e = 1;
-	opts.e2e_hopid = TBNET_DATA_RING;
-	opts.sof_mask = 1u << TBNET_PDF_FRAME_START;
-	opts.eof_mask = 1u << TBNET_PDF_FRAME_END;
-	error = nhi_ring_create(nsc, TBNET_DATA_RING, TBNET_RING_DEPTH,
-	    TBNET_RING_DEPTH, &opts, &ts->ring);
+	opts.e2e_hopid = TBNET_DATA_TX_RING;	/* credits egress via the TX ring */
+	error = nhi_ring_create(nsc, TBNET_DATA_TX_RING, TBNET_RING_DEPTH,
+	    TBNET_RING_DEPTH, &opts, &ts->txring);
 	if (error != 0)
 		goto fail;
 
-	/* RX: dispatch frame-end (EOF) frames to our callback.  No TX callback
-	 * (SOF=FRAME_START is unregistered, so nhi_tx_complete auto-frees). */
+	opts.sof_mask = 1u << TBNET_PDF_FRAME_START;
+	opts.eof_mask = 1u << TBNET_PDF_FRAME_END;
+	error = nhi_ring_create(nsc, TBNET_DATA_RX_RING, TBNET_RING_DEPTH,
+	    TBNET_RING_DEPTH, &opts, &ts->rxring);
+	if (error != 0)
+		goto fail_txring;
+
+	/* RX: dispatch frame-end (EOF) frames on the RX ring to our callback.
+	 * No TX callback (SOF=FRAME_START unregistered -> nhi_tx_complete auto-
+	 * frees on the TX ring). */
 	txd[0].pdf = 0; txd[0].cb = NULL; txd[0].context = NULL;
 	rxd[0].pdf = TBNET_PDF_FRAME_END;
 	rxd[0].cb = tbnet_rx_cb;
 	rxd[0].context = ts;
 	rxd[1].pdf = 0; rxd[1].cb = NULL; rxd[1].context = NULL;
-	if ((error = nhi_register_pdf(ts->ring, txd, rxd)) != 0)
-		goto fail_ring;
+	if ((error = nhi_register_pdf(ts->rxring, txd, rxd)) != 0)
+		goto fail_rxring;
 
-	if ((error = nhi_ring_start(ts->ring)) != 0)
+	if ((error = nhi_ring_start(ts->txring)) != 0)
+		goto fail_pdf;
+	if ((error = nhi_ring_start(ts->rxring)) != 0)
 		goto fail_pdf;
 
 	ifp = if_alloc(IFT_ETHER);
@@ -182,9 +193,11 @@ tbnet_attach(struct nhi_softc *nsc, const uint8_t *mac, const uint8_t *peer_mac,
 	return (0);
 
 fail_pdf:
-	nhi_deregister_pdf(ts->ring, txd, rxd);
-fail_ring:
-	nhi_ring_destroy(ts->ring);
+	nhi_deregister_pdf(ts->rxring, txd, rxd);
+fail_rxring:
+	nhi_ring_destroy(ts->rxring);
+fail_txring:
+	nhi_ring_destroy(ts->txring);
 fail:
 	mtx_destroy(&ts->lock);
 	free(ts, M_NHI);
@@ -203,13 +216,15 @@ tbnet_detach(struct tbnet_softc *ts)
 		CURVNET_RESTORE();
 		if_free(ts->ifp);
 	}
-	nhi_ring_stop(ts->ring);
+	nhi_ring_stop(ts->rxring);
+	nhi_ring_stop(ts->txring);
 	txd[0].pdf = 0; txd[0].cb = NULL; txd[0].context = NULL;
 	rxd[0].pdf = TBNET_PDF_FRAME_END; rxd[0].cb = tbnet_rx_cb;
 	rxd[0].context = ts;
 	rxd[1].pdf = 0; rxd[1].cb = NULL; rxd[1].context = NULL;
-	nhi_deregister_pdf(ts->ring, txd, rxd);
-	nhi_ring_destroy(ts->ring);
+	nhi_deregister_pdf(ts->rxring, txd, rxd);
+	nhi_ring_destroy(ts->rxring);
+	nhi_ring_destroy(ts->txring);
 	tbnet_reass_reset(ts);
 	mtx_destroy(&ts->lock);
 	free(ts, M_NHI);
@@ -246,7 +261,7 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 	for (index = 0, off = 0; index < count; index++, off += chunk) {
 		chunk = MIN(pktlen - off, TBNET_MAX_PAYLOAD);
 
-		cmd = nhi_alloc_tx_frame(ts->ring);
+		cmd = nhi_alloc_tx_frame(ts->txring);
 		if (cmd == NULL) {		/* TX ring full */
 			error = ENOBUFS;
 			break;
@@ -261,9 +276,9 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 		cmd->req_len = TBNET_HDR_LEN + chunk;
 		cmd->sof = TBNET_PDF_FRAME_START;	/* descriptor SOF */
 		cmd->pdf = TBNET_PDF_FRAME_END;		/* descriptor EOF */
-		error = nhi_tx_schedule(ts->ring, cmd);
+		error = nhi_tx_schedule(ts->txring, cmd);
 		if (error != 0) {
-			nhi_free_tx_frame(ts->ring, cmd);
+			nhi_free_tx_frame(ts->txring, cmd);
 			break;
 		}
 	}
