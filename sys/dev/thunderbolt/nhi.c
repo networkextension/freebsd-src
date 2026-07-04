@@ -73,6 +73,8 @@ static int nhi_deactivate_ring(struct nhi_ring_pair *);
 static int nhi_alloc_ring0(struct nhi_softc *);
 static void nhi_free_ring0(struct nhi_softc *);
 static void nhi_fill_rx_ring(struct nhi_softc *, struct nhi_ring_pair *);
+static void nhi_ring_process(struct nhi_ring_pair *);
+static void nhi_rxpoll_timer(void *);
 static int nhi_init(struct nhi_softc *);
 static void nhi_post_init(void *);
 static int nhi_tx_enqueue(struct nhi_ring_pair *, struct nhi_cmd_frame *);
@@ -889,7 +891,24 @@ nhi_ring_create(struct nhi_softc *sc, u_int ringnum, u_int tx_depth,
 	if (ringnum < sc->msix_count) {
 		sc->intr_trackers[ringnum].ring = r;
 		r->tracker = &sc->intr_trackers[ringnum];
+	} else {
+		/*
+		 * No MSI-X vector for this ring, and no shared tracker slot
+		 * either (the tracker array is sized msix_count).  Give it a
+		 * private tracker so rxpdf callbacks have somewhere to live, and
+		 * drain it by polling (nhi_ring_start) instead of by interrupt.
+		 */
+		r->tracker = malloc(sizeof(*r->tracker), M_NHI,
+		    M_ZERO | M_NOWAIT);
+		if (r->tracker == NULL) {
+			nhi_free_ring(r);
+			return (ENOMEM);
+		}
+		r->tracker->sc = sc;
+		r->tracker->ring = r;
+		r->priv_tracker = true;
 	}
+	callout_init(&r->rxpoll_co, 1);
 
 	SLIST_INSERT_HEAD(&sc->ring_list, r, ring_link);
 	*rp = r;
@@ -905,13 +924,24 @@ nhi_ring_start(struct nhi_ring_pair *r)
 	if ((error = nhi_configure_ring(sc, r)) != 0)
 		return (error);
 	nhi_fill_rx_ring(sc, r);
-	return (nhi_activate_ring(r));
+	if ((error = nhi_activate_ring(r)) != 0)
+		return (error);
+	if (r->priv_tracker) {
+		/* Vector-less ring: service RX by polling. */
+		r->rxpoll_active = true;
+		callout_reset(&r->rxpoll_co, 1, nhi_rxpoll_timer, r);
+	}
+	return (0);
 }
 
 int
 nhi_ring_stop(struct nhi_ring_pair *r)
 {
 
+	if (r->priv_tracker) {
+		r->rxpoll_active = false;
+		callout_stop(&r->rxpoll_co);
+	}
 	return (nhi_deactivate_ring(r));
 }
 
@@ -919,6 +949,13 @@ void
 nhi_ring_destroy(struct nhi_ring_pair *r)
 {
 
+	if (r->priv_tracker) {
+		r->rxpoll_active = false;	/* stop the callout re-arming */
+		callout_drain(&r->rxpoll_co);
+		free(r->tracker, M_NHI);
+		r->tracker = NULL;
+		r->priv_tracker = false;
+	}
 	SLIST_REMOVE(&r->sc->ring_list, r, nhi_ring_pair, ring_link);
 	if (r->cmds != NULL) {
 		free(r->cmds, M_NHI);
@@ -1275,24 +1312,15 @@ nhi_deregister_pdf(struct nhi_ring_pair *rp, struct nhi_dispatch *tx,
  * hardware touched.  This technique saves at least 2 MEMIO reads per
  * interrupt.
  */
-void
-nhi_intr(void *data)
+static void
+nhi_ring_process(struct nhi_ring_pair *r)
 {
 	union nhi_ring_desc *rxd;
 	struct nhi_cmd_frame *cmd;
-	struct nhi_intr_tracker *trkr = data;
-	struct nhi_softc *sc;
-	struct nhi_ring_pair *r;
+	struct nhi_softc *sc = r->sc;
 	struct nhi_tx_buffer_desc *txd;
 	uint32_t val, old_ci;
 	u_int count;
-
-	sc = trkr->sc;
-
-	tb_debug(sc, DBG_INTR|DBG_FULL, "Interrupt @ vector %d\n",
-	    trkr->vector);
-	if ((r = trkr->ring) == NULL)
-		return;
 
 	/*
 	 * Process TX completions from the adapter.  Only go through
@@ -1378,6 +1406,36 @@ nhi_intr(void *data)
 		    "Writing new RX PICI= 0x%08x\n", val);
 		nhi_write_reg(sc, r->rx_pici_reg, val);
 	}
+}
+
+/*
+ * Poll a vector-less ring by draining it on a callout (see
+ * nhi_ring_pair.rxpoll_co).  Runs only for rings whose number is >= msix_count
+ * - those have no MSI-X vector, so this never races the interrupt path.  This
+ * is the RX path when MSI-X allocation gives too few vectors (Meteor Lake),
+ * matching the standalone driver's poll loop and macOS's poll timer.
+ */
+static void
+nhi_rxpoll_timer(void *arg)
+{
+	struct nhi_ring_pair *r = arg;
+
+	if (!r->rxpoll_active)
+		return;
+	nhi_ring_process(r);
+	callout_reset(&r->rxpoll_co, 1, nhi_rxpoll_timer, r);
+}
+
+void
+nhi_intr(void *data)
+{
+	struct nhi_intr_tracker *trkr = data;
+	struct nhi_ring_pair *r;
+
+	tb_debug(trkr->sc, DBG_INTR|DBG_FULL, "Interrupt @ vector %d\n",
+	    trkr->vector);
+	if ((r = trkr->ring) != NULL)
+		nhi_ring_process(r);
 }
 
 static int

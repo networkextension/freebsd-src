@@ -135,6 +135,19 @@ struct nhi_ring_pair {
 	u_char			e2e_hopid;	/* paired TX hop for RX E2E */
 	uint16_t		sof_mask;	/* RX start-of-frame PDF bitmap */
 	uint16_t		eof_mask;	/* RX end-of-frame PDF bitmap */
+
+	/*
+	 * RX poll fallback.  MSI-X allocation is flaky on some hosts (Meteor
+	 * Lake advertises 16 vectors but pci_alloc_msix fails, so the driver
+	 * runs on 2 MSI vectors).  A ring whose number is >= msix_count gets no
+	 * dedicated vector - and no shared tracker either, since the tracker
+	 * array is sized msix_count.  Such a ring is given a private tracker
+	 * (for rxpdf storage) and is drained by a callout instead of an
+	 * interrupt, matching the standalone driver's and macOS's poll path.
+	 */
+	struct callout		rxpoll_co;
+	bool			rxpoll_active;
+	bool			priv_tracker;	/* r->tracker was malloc'd here */
 };
 
 /*
