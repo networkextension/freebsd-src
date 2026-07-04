@@ -1379,33 +1379,53 @@ nhi_ring_process(struct nhi_ring_pair *r)
 	 */
 	count = r->tx_ring_depth;
 	while (count-- > 0) {
+		/*
+		 * Serialise the TX-completion consumer (tx_ci and
+		 * tx_cmd_ring[tx_ci]) with the TX submit path (nhi_tx_enqueue),
+		 * which mutates the same state under r->mtx.  This function runs
+		 * unlocked from the RX poll callout / ISR, so without the lock a
+		 * concurrent submit (e.g. the stream of TCP-ACK sends during a
+		 * bidirectional SMB transfer) can torn-read tx_cmd_ring and hand
+		 * nhi_tx_complete a garbage non-NULL pointer -> heap-address page
+		 * fault under sustained load.
+		 *
+		 * Two traps this ordering avoids:
+		 *  - Lock ONLY the index read+advance.  nhi_tx_complete ->
+		 *    nhi_free_tx_frame re-acquires r->mtx (non-recursive MTX_DEF),
+		 *    so completion must run with the lock dropped.
+		 *  - Never hold a ring lock across the RX loop below, which calls
+		 *    if_input(); the stack transmits synchronously in response
+		 *    (ARP/ACK) and re-enters nhi_tx_enqueue -> mtx_lock(&r->mtx).
+		 *    The RX loop is single-consumer (one callout per ring), so it
+		 *    needs no lock.
+		 */
+		mtx_lock(&r->mtx);
 		txd = &r->tx_ring[r->tx_ci].tx;
-		if ((txd->flags_sof & TX_BUFFER_DESC_DONE) == 0)
+		if ((txd->flags_sof & TX_BUFFER_DESC_DONE) == 0) {
+			mtx_unlock(&r->mtx);
 			break;
+		}
 		cmd = r->tx_cmd_ring[r->tx_ci];
 		tb_debug(sc, DBG_INTR|DBG_TXQ|DBG_FULL,
 		    "Found tx cmdidx= %d cmd= %p\n", r->tx_ci, cmd);
+		r->tx_ci = (r->tx_ci + 1) & r->tx_ring_mask;
+		mtx_unlock(&r->mtx);
 
 		/*
-		 * Pass the completion up the stack.  cmd is NULL for a TX slot
-		 * we never submitted to (e.g. the RX ring's unused TX side, which
-		 * the poll still scans) - a stray/garbage DONE bit there would
-		 * otherwise deref a NULL cmd in nhi_tx_complete.
+		 * Pass the completion up the stack, unlocked.  cmd is NULL for a
+		 * TX slot we never submitted to (e.g. the RX ring's unused TX
+		 * side, which the poll still scans) - a stray/garbage DONE bit
+		 * there would otherwise deref a NULL cmd in nhi_tx_complete.
 		 */
 		if (cmd != NULL)
 			nhi_tx_complete(r, txd, cmd);
 
 		/*
-		 * Advance to the next item in the ring via the cached
-		 * copy of the CI.  Clear the flags so we can detect
-		 * a new done condition the next time the ring wraps
-		 * around.  Anything higher up the stack that needs this
-		 * field should have already copied it.
-		 *
-		 * XXX is a memory barrier needed?
+		 * Clear DONE only after nhi_tx_complete has read flags_sof.  Safe
+		 * unlocked: tx_ci has already advanced past this slot, which is
+		 * not reused until the ring wraps ~tx_ring_depth submits later.
 		 */
 		txd->flags_sof = 0;
-		r->tx_ci = (r->tx_ci + 1) & r->tx_ring_mask;
 	}
 
 	/* Process RX packets from the adapter */
