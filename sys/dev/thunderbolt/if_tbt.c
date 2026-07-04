@@ -363,6 +363,18 @@ tbnet_ioctl(if_t ifp, u_long cmd, caddr_t data)
 			return (EINVAL);
 		if_setmtu(ifp, ifr->ifr_mtu);
 		return (0);
+	case SIOCSIFFLAGS:
+		/*
+		 * ThunderboltIP is point-to-point: we already receive every
+		 * frame on the RX ring, so promiscuous / allmulti are no-ops.
+		 * Accept the flag change (ether_ioctl rejects SIOCSIFFLAGS with
+		 * EINVAL) so bpf/tcpdump can enable promiscuous mode.
+		 */
+		return (0);
+	case SIOCADDMULTI:
+	case SIOCDELMULTI:
+		/* No hardware multicast filter; all frames are delivered. */
+		return (0);
 	default:
 		return (ether_ioctl(ifp, cmd, data));
 	}
