@@ -402,6 +402,7 @@ SUBDIR=	\
 	tarfs \
 	tcp \
 	${_thunderbolt} \
+	nhi_icm \
 	${_ti} \
 	tmpfs \
 	${_toecore} \
