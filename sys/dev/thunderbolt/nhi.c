@@ -580,8 +580,16 @@ nhi_activate_ring(struct nhi_ring_pair *ring)
 	uint32_t txflags, rxflags;
 	int idx;
 
-	/* Route this ring's TX/RX completions to its own MSI-X vector. */
-	nhi_pci_enable_interrupt(ring);
+	/*
+	 * Only the control ring (0) is interrupt-driven.  Data rings are always
+	 * serviced by the poll (nhi_ring_start), because their per-ring MSI-X
+	 * vectors are unreliable on this hardware.  We must NOT also enable their
+	 * interrupt: on a controller where the vector does fire (e.g. ring 1's TX
+	 * completions), the ISR and the poll would both run nhi_ring_process on
+	 * the same ring and corrupt its indices - that page-faulted under load.
+	 */
+	if (ring->ring_num == 0)
+		nhi_pci_enable_interrupt(ring);
 
 	idx = ring->ring_num * 32;
 	tb_debug(sc, DBG_INIT, "Activating ring %d at idx %d\n",
@@ -929,13 +937,34 @@ nhi_ring_start(struct nhi_ring_pair *r)
 
 	if ((error = nhi_configure_ring(sc, r)) != 0)
 		return (error);
-	nhi_fill_rx_ring(sc, r);
+	/*
+	 * Activate (set the ring VALID + arm E2E) BEFORE posting RX buffers.
+	 * nhi_fill_rx_ring's doorbell write publishes the posted-buffer count,
+	 * which the fabric uses as the initial E2E credit grant to the peer.
+	 * If buffers are posted while the ring is not yet VALID, the hardware
+	 * discards the producer update and the ring advertises 0 credits - the
+	 * peer's fully E2E-gated ThunderboltIP transmitter then never puts a
+	 * frame on the wire (Mac->FreeBSD RX = 0, while TX and login are fine).
+	 * Ring 0 and the proven standalone both activate-then-fill; the earlier
+	 * fill-then-activate order here latched RX credits at zero.
+	 */
 	if ((error = nhi_activate_ring(r)) != 0)
 		return (error);
-	if (r->priv_tracker) {
-		/* Vector-less ring: service RX by polling. */
+	nhi_fill_rx_ring(sc, r);
+	/*
+	 * Service data rings by polling.  On this hardware the per-ring MSI-X
+	 * vectors do not fire even when pci_alloc_msix reports many vectors -
+	 * only vector 0 (the control ring) is reliable - so a data ring that
+	 * relied on its dedicated vector would never be serviced (RX dead, TX
+	 * completions never reclaimed).  nhi_ring_start is only called for data
+	 * rings (ring 0 is brought up directly in nhi_attach and keeps its
+	 * working vector-0 interrupt).  This matches the standalone driver's
+	 * busy-poll and macOS's integrated-controller poll timer.
+	 */
+	if (r->ring_num != 0) {
 		r->rxpoll_active = true;
 		callout_reset(&r->rxpoll_co, 1, nhi_rxpoll_timer, r);
+		tb_debug(sc, DBG_INIT, "ring%d serviced by poll\n", r->ring_num);
 	}
 	return (0);
 }
@@ -1425,24 +1454,9 @@ static void
 nhi_rxpoll_timer(void *arg)
 {
 	struct nhi_ring_pair *r = arg;
-	uint32_t pici;
-	uint16_t hw_pi;
 
 	if (!r->rxpoll_active)
 		return;
-	/*
-	 * Diagnostic (rate-limited to ~1/s): read the firmware's RX producer
-	 * index.  If it advances while a peer sends, the firmware IS DMAing
-	 * frames into this ring (loss is on our side); if it stays 0, the
-	 * firmware is not routing to this ring (APPROVE/hop/ring issue).
-	 */
-	if ((r->dbg_polls++ & 0x3ff) == 0) {
-		pici = nhi_read_reg(r->sc, r->rx_pici_reg);
-		hw_pi = (pici >> RX_RING_PI_SHIFT) & RX_RING_CI_MASK;
-		device_printf(r->sc->dev,
-		    "ring%d hw RX PI= %u (our pi=%u ci=%u pici=0x%08x)\n",
-		    r->ring_num, hw_pi, r->rx_pi, r->rx_ci, pici);
-	}
 	nhi_ring_process(r);
 	callout_reset(&r->rxpoll_co, 1, nhi_rxpoll_timer, r);
 }
