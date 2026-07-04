@@ -102,28 +102,65 @@ tbnet_reass_reset(struct tbnet_softc *ts)
 }
 
 /*
- * Bring the ThunderboltIP interface up on the official transport.  The hop ids
- * come from the ThunderboltIP login (done elsewhere); the connection manager
- * (Step 3) must still APPROVE_XDOMAIN the tunnel before frames actually flow.
+ * Create the resident ThunderboltIP interface at driver load - present as soon
+ * as the driver attaches, independent of any peer (macOS-style: the Thunderbolt
+ * Bridge is always there; carrier follows the link).  No data rings yet: those
+ * come up in tbnet_connect() once the ThunderboltIP login + APPROVE complete.
+ * The MAC is caller-supplied and stable (peer-independent).
  */
 int
-tbnet_attach(struct nhi_softc *nsc, const uint8_t *mac, const uint8_t *peer_mac,
-    u_int local_tx_hopid __unused, u_int remote_tx_hopid __unused,
-    struct tbnet_softc **tsp)
+tbnet_create(struct nhi_softc *nsc, const uint8_t *mac, struct tbnet_softc **tsp)
 {
-	struct nhi_ring_opts opts;
-	struct nhi_dispatch txd[1], rxd[2];
 	struct tbnet_softc *ts;
 	if_t ifp;
-	int error;
 
 	ts = malloc(sizeof(*ts), M_NHI, M_NOWAIT | M_ZERO);
 	if (ts == NULL)
 		return (ENOMEM);
 	ts->nsc = nsc;
 	memcpy(ts->mac, mac, ETHER_ADDR_LEN);
-	memcpy(ts->peer_mac, peer_mac, ETHER_ADDR_LEN);
 	mtx_init(&ts->lock, "tbnet", NULL, MTX_DEF);
+
+	ifp = if_alloc(IFT_ETHER);
+	ts->ifp = ifp;
+	if_setsoftc(ifp, ts);
+	if_initname(ifp, "tbt", device_get_unit(nsc->dev));
+	if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
+	if_setmtu(ifp, ETHERMTU);
+	if_settransmitfn(ifp, tbnet_transmit);
+	if_setqflushfn(ifp, tbnet_qflush);
+	if_setinitfn(ifp, tbnet_init);
+	if_setioctlfn(ifp, tbnet_ioctl);
+	/*
+	 * We are called from the ICM taskqueue thread, which has no vnet
+	 * context; if_attach_internal dereferences curvnet (VIMAGE is on in
+	 * GENERIC) and panics without this.
+	 */
+	CURVNET_SET(vnet0);
+	ether_ifattach(ifp, ts->mac);
+	CURVNET_RESTORE();
+	/* Interface exists but the link is down until a peer logs in. */
+	if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
+	if_link_state_change(ifp, LINK_STATE_DOWN);
+
+	*tsp = ts;
+	return (0);
+}
+
+/*
+ * Raise carrier: allocate the data rings and start moving frames.  Called once
+ * the ThunderboltIP login completes and the CM has APPROVEd the tunnel.
+ * Idempotent - a second call while already connected is a no-op.
+ */
+int
+tbnet_connect(struct tbnet_softc *ts)
+{
+	struct nhi_ring_opts opts;
+	struct nhi_dispatch txd[1], rxd[2];
+	int error;
+
+	if (ts->txring != NULL)			/* already up */
+		return (0);
 
 	/*
 	 * Two FRAME-mode, E2E rings, matching the proven ThunderboltIP data
@@ -132,22 +169,22 @@ tbnet_attach(struct nhi_softc *nsc, const uint8_t *mac, const uint8_t *peer_mac,
 	 * on the TX ring (e2e_hopid = the TX ring), so a single bidirectional
 	 * ring never sources credits and the peer's fully-E2E transmitter never
 	 * puts a frame on the wire (observed as RX = 0).  Local ring numbers are
-	 * not visible to the peer; the connection manager's APPROVE maps the
-	 * fabric paths onto transmit_ring = TX ring, receive_ring = RX ring.
+	 * not visible to the peer; the CM's APPROVE maps the fabric paths onto
+	 * transmit_ring = TX ring, receive_ring = RX ring.
 	 */
 	memset(&opts, 0, sizeof(opts));
 	opts.frame_size = TBNET_FRAME_SIZE;
 	opts.frame_mode = 1;
 	opts.e2e = 1;
 	opts.e2e_hopid = TBNET_DATA_TX_RING;	/* credits egress via the TX ring */
-	error = nhi_ring_create(nsc, TBNET_DATA_TX_RING, TBNET_RING_DEPTH,
+	error = nhi_ring_create(ts->nsc, TBNET_DATA_TX_RING, TBNET_RING_DEPTH,
 	    TBNET_RING_DEPTH, &opts, &ts->txring);
 	if (error != 0)
-		goto fail;
+		return (error);
 
 	opts.sof_mask = 1u << TBNET_PDF_FRAME_START;
 	opts.eof_mask = 1u << TBNET_PDF_FRAME_END;
-	error = nhi_ring_create(nsc, TBNET_DATA_RX_RING, TBNET_RING_DEPTH,
+	error = nhi_ring_create(ts->nsc, TBNET_DATA_RX_RING, TBNET_RING_DEPTH,
 	    TBNET_RING_DEPTH, &opts, &ts->rxring);
 	if (error != 0)
 		goto fail_txring;
@@ -168,54 +205,36 @@ tbnet_attach(struct nhi_softc *nsc, const uint8_t *mac, const uint8_t *peer_mac,
 	if ((error = nhi_ring_start(ts->rxring)) != 0)
 		goto fail_pdf;
 
-	ifp = if_alloc(IFT_ETHER);
-	ts->ifp = ifp;
-	if_setsoftc(ifp, ts);
-	if_initname(ifp, "tbt", device_get_unit(nsc->dev));
-	if_setflags(ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST);
-	if_setmtu(ifp, ETHERMTU);
-	if_settransmitfn(ifp, tbnet_transmit);
-	if_setqflushfn(ifp, tbnet_qflush);
-	if_setinitfn(ifp, tbnet_init);
-	if_setioctlfn(ifp, tbnet_ioctl);
-	/*
-	 * We are called from the ICM taskqueue thread, which has no vnet
-	 * context; if_attach_internal dereferences curvnet (VIMAGE is on in
-	 * GENERIC) and panics without this.
-	 */
-	CURVNET_SET(vnet0);
-	ether_ifattach(ifp, ts->mac);
-	CURVNET_RESTORE();
-	if_setdrvflagbits(ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
-	if_link_state_change(ifp, LINK_STATE_UP);
-
-	*tsp = ts;
+	if_setdrvflagbits(ts->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
+	if_link_state_change(ts->ifp, LINK_STATE_UP);
 	return (0);
 
 fail_pdf:
 	nhi_deregister_pdf(ts->rxring, txd, rxd);
 fail_rxring:
 	nhi_ring_destroy(ts->rxring);
+	ts->rxring = NULL;
 fail_txring:
 	nhi_ring_destroy(ts->txring);
-fail:
-	mtx_destroy(&ts->lock);
-	free(ts, M_NHI);
+	ts->txring = NULL;
 	return (error);
 }
 
+/*
+ * Drop carrier and tear down the data rings, but keep the resident interface so
+ * it reconnects cleanly.  Idempotent - safe if the rings were never up.
+ */
 void
-tbnet_detach(struct tbnet_softc *ts)
+tbnet_disconnect(struct tbnet_softc *ts)
 {
 	struct nhi_dispatch txd[1], rxd[2];
 
 	if (ts->ifp != NULL) {
+		if_setdrvflagbits(ts->ifp, 0, IFF_DRV_RUNNING);
 		if_link_state_change(ts->ifp, LINK_STATE_DOWN);
-		CURVNET_SET(vnet0);		/* no vnet context in the ICM taskq */
-		ether_ifdetach(ts->ifp);
-		CURVNET_RESTORE();
-		if_free(ts->ifp);
 	}
+	if (ts->txring == NULL)			/* rings were never up */
+		return;
 	nhi_ring_stop(ts->rxring);
 	nhi_ring_stop(ts->txring);
 	txd[0].pdf = 0; txd[0].cb = NULL; txd[0].context = NULL;
@@ -225,7 +244,25 @@ tbnet_detach(struct tbnet_softc *ts)
 	nhi_deregister_pdf(ts->rxring, txd, rxd);
 	nhi_ring_destroy(ts->rxring);
 	nhi_ring_destroy(ts->txring);
+	ts->rxring = NULL;
+	ts->txring = NULL;
+	mtx_lock(&ts->lock);
 	tbnet_reass_reset(ts);
+	mtx_unlock(&ts->lock);
+}
+
+/* Full teardown at driver unload: drop the link, detach and free the ifnet. */
+void
+tbnet_destroy(struct tbnet_softc *ts)
+{
+	tbnet_disconnect(ts);
+	if (ts->ifp != NULL) {
+		CURVNET_SET(vnet0);		/* no vnet context in the ICM taskq */
+		ether_ifdetach(ts->ifp);
+		CURVNET_RESTORE();
+		if_free(ts->ifp);
+		ts->ifp = NULL;
+	}
 	mtx_destroy(&ts->lock);
 	free(ts, M_NHI);
 }
@@ -245,8 +282,8 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 	uint16_t id;
 	int error = 0;
 
-	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0) {
-		m_freem(m);
+	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0 || ts->txring == NULL) {
+		m_freem(m);		/* no carrier / rings not up (no peer) */
 		return (ENETDOWN);
 	}
 	pktlen = m_length(m, NULL);
@@ -303,8 +340,14 @@ tbnet_init(void *arg)
 {
 	struct tbnet_softc *ts = arg;
 
-	if (ts->ifp != NULL)
-		if_setdrvflagbits(ts->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
+	/*
+	 * The interface is resident and can be brought up (ifconfig up, IP
+	 * assignment) with no peer.  Do NOT claim IFF_DRV_RUNNING here - the
+	 * driver is only ready to transmit once the data rings exist, which
+	 * happens in tbnet_connect() when a peer logs in.  Setting RUNNING with
+	 * ts->txring == NULL lets tbnet_transmit dereference a NULL ring.
+	 */
+	(void)ts;
 }
 
 static int

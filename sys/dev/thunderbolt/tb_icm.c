@@ -41,6 +41,7 @@
 #include <sys/taskqueue.h>
 #include <machine/bus.h>
 
+#include <dev/pci/pcivar.h>
 #include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/nhi_var.h>
 #include <dev/thunderbolt/tb_xdomain.h>
@@ -317,16 +318,15 @@ tb_icm_bringup(void *arg, int pending __unused)
 		return;
 	}
 	tb_icm_install_tx_hop(icm);
-	if (tbnet_attach(icm->nsc, icm->tbt_mac, icm->peer_mac,
-	    icm->local_tx_hopid, icm->remote_tx_hopid, &icm->net) != 0) {
-		device_printf(icm->nsc->dev, "bring-up: tbnet_attach failed\n");
+	if (icm->net == NULL || tbnet_connect(icm->net) != 0) {
+		device_printf(icm->nsc->dev, "bring-up: tbnet_connect failed\n");
 		return;
 	}
 	icm->paths_approved = true;
 	device_printf(icm->nsc->dev, "tbt: link UP\n");
 }
 
-/* Taskqueue: peer went away.  tbnet_detach does ether_ifdetach + DMA/ring
+/* Taskqueue: peer went away.  tbnet_disconnect does DMA/ring
  * teardown, which must not run in the interrupt event callback - defer here.
  * Serialized with tb_icm_bringup on the single-thread taskqueue, so icm->net
  * needs no extra lock between them. */
@@ -335,10 +335,8 @@ tb_icm_teardown(void *arg, int pending __unused)
 {
 	struct tb_icm *icm = arg;
 
-	if (icm->net != NULL) {
-		tbnet_detach(icm->net);
-		icm->net = NULL;
-	}
+	if (icm->net != NULL)
+		tbnet_disconnect(icm->net);	/* keep the resident interface */
 	icm->paths_approved = false;
 }
 
@@ -385,20 +383,27 @@ tbip_jhash2(const uint32_t *k, uint32_t length, uint32_t initval)
 }
 
 static void
-tbip_derive_mac(struct tb_icm *icm)
+tb_icm_gen_mac(struct tb_icm *icm)
 {
-	uint32_t k[4], hash;
-	int i;
+	device_t dev = icm->nsc->dev;
+	uint32_t k[2], hash;
 
-	for (i = 0; i < 4; i++)
-		k[i] = le32dec(icm->local_uuid + i * 4);
+	/*
+	 * Stable, peer-independent MAC from the NHI's PCI identity.  We need it
+	 * at driver load (the interface is resident, before any peer, so we do
+	 * not yet know our XDomain UUID); the peer discovers it via ARP, so it
+	 * need not be UUID-derived.
+	 */
+	k[0] = pci_get_devid(dev);
+	k[1] = (pci_get_bus(dev) << 16) | (pci_get_slot(dev) << 8) |
+	    pci_get_function(dev);
+	hash = tbip_jhash2(k, 2, 0);
 	icm->tbt_mac[0] = 0x02;			/* locally administered, unicast */
-	hash = tbip_jhash2(k, 4, 0);
 	icm->tbt_mac[1] = hash & 0xff;
 	icm->tbt_mac[2] = (hash >> 8) & 0xff;
 	icm->tbt_mac[3] = (hash >> 16) & 0xff;
 	icm->tbt_mac[4] = (hash >> 24) & 0xff;
-	hash = tbip_jhash2(k, 4, hash);
+	hash = tbip_jhash2(k, 2, hash);
 	icm->tbt_mac[5] = hash & 0xff;
 	icm->local_tx_hopid = 8;
 }
@@ -564,7 +569,6 @@ tb_icm_event_cb(void *context, union nhi_ring_desc *rdesc,
 		icm->has_peer = true;
 		icm->login_sent = icm->login_received = icm->paths_approved = false;
 		icm->login_tries = icm->logout_kicks = 0;
-		tbip_derive_mac(icm);
 		tb_xdomain_set_peer(icm->xd, icm->peer_uuid, icm->local_uuid,
 		    icm->peer_route_hi, icm->peer_route_lo);
 		tbip_send_logout(icm);		/* reset a stale peer session */
@@ -634,6 +638,16 @@ tb_icm_init(struct nhi_softc *nsc, struct nhi_ring_pair *ring0,
 	if ((error = tb_icm_driver_ready(icm)) != 0)
 		goto fail_pdf;
 
+	/*
+	 * Bring up the resident ThunderboltIP interface now, at load - present
+	 * with a stable MAC and link DOWN, independent of any peer (macOS-style
+	 * Thunderbolt Bridge).  Carrier is raised in tb_icm_bringup() once a peer
+	 * logs in; DHCP (client or server) can bind to tbtN immediately.
+	 */
+	tb_icm_gen_mac(icm);
+	if ((error = tbnet_create(nsc, icm->tbt_mac, &icm->net)) != 0)
+		goto fail_pdf;
+
 	*icmp = icm;
 	return (0);
 
@@ -681,7 +695,7 @@ tb_icm_fini(struct tb_icm *icm)
 	taskqueue_free(icm->tq);
 
 	if (icm->net != NULL)
-		tbnet_detach(icm->net);
+		tbnet_destroy(icm->net);
 	mtx_destroy(&icm->lock);
 	free(icm, M_NHI);
 }
