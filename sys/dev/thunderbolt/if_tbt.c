@@ -167,7 +167,14 @@ tbnet_attach(struct nhi_softc *nsc, const uint8_t *mac, const uint8_t *peer_mac,
 	if_setqflushfn(ifp, tbnet_qflush);
 	if_setinitfn(ifp, tbnet_init);
 	if_setioctlfn(ifp, tbnet_ioctl);
+	/*
+	 * We are called from the ICM taskqueue thread, which has no vnet
+	 * context; if_attach_internal dereferences curvnet (VIMAGE is on in
+	 * GENERIC) and panics without this.
+	 */
+	CURVNET_SET(vnet0);
 	ether_ifattach(ifp, ts->mac);
+	CURVNET_RESTORE();
 	if_setdrvflagbits(ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
 	if_link_state_change(ifp, LINK_STATE_UP);
 
@@ -191,7 +198,9 @@ tbnet_detach(struct tbnet_softc *ts)
 
 	if (ts->ifp != NULL) {
 		if_link_state_change(ts->ifp, LINK_STATE_DOWN);
+		CURVNET_SET(vnet0);		/* no vnet context in the ICM taskq */
 		ether_ifdetach(ts->ifp);
+		CURVNET_RESTORE();
 		if_free(ts->ifp);
 	}
 	nhi_ring_stop(ts->ring);

@@ -89,6 +89,7 @@ struct tb_icm {
 	struct mtx		lock;
 	struct taskqueue	*tq;
 	struct task		bringup_task;
+	struct task		teardown_task;
 	struct callout		login_co;
 	bool			dying;		/* teardown: stop callout re-arm */
 
@@ -322,6 +323,22 @@ tb_icm_bringup(void *arg, int pending __unused)
 	}
 	icm->paths_approved = true;
 	device_printf(icm->nsc->dev, "tbt: link UP\n");
+}
+
+/* Taskqueue: peer went away.  tbnet_detach does ether_ifdetach + DMA/ring
+ * teardown, which must not run in the interrupt event callback - defer here.
+ * Serialized with tb_icm_bringup on the single-thread taskqueue, so icm->net
+ * needs no extra lock between them. */
+static void
+tb_icm_teardown(void *arg, int pending __unused)
+{
+	struct tb_icm *icm = arg;
+
+	if (icm->net != NULL) {
+		tbnet_detach(icm->net);
+		icm->net = NULL;
+	}
+	icm->paths_approved = false;
 }
 
 /* ---- ThunderboltIP login (the XDomain service handler) ------------------- */
@@ -559,11 +576,9 @@ tb_icm_event_cb(void *context, union nhi_ring_desc *rdesc,
 	case ICM_EVENT_XDOMAIN_DISCONNECTED:
 		icm->has_peer = false;
 		callout_stop(&icm->login_co);
-		if (icm->net != NULL) {
-			tbnet_detach(icm->net);
-			icm->net = NULL;
-		}
-		icm->paths_approved = false;
+		/* Defer the net teardown to a thread; we are in interrupt ctx. */
+		if (!icm->dying)
+			taskqueue_enqueue(icm->tq, &icm->teardown_task);
 		device_printf(icm->nsc->dev, "xdomain disconnected\n");
 		break;
 	case ICM_EVENT_DEVICE_CONNECTED:
@@ -593,6 +608,7 @@ tb_icm_init(struct nhi_softc *nsc, struct nhi_ring_pair *ring0,
 	mtx_init(&icm->lock, "tbicm", NULL, MTX_DEF);
 	callout_init(&icm->login_co, 1);
 	TASK_INIT(&icm->bringup_task, 0, tb_icm_bringup, icm);
+	TASK_INIT(&icm->teardown_task, 0, tb_icm_teardown, icm);
 	icm->tq = taskqueue_create("tbicm", M_NOWAIT, taskqueue_thread_enqueue,
 	    &icm->tq);
 	if (icm->tq == NULL) {
@@ -660,6 +676,7 @@ tb_icm_fini(struct tb_icm *icm)
 
 	callout_drain(&icm->login_co);
 	taskqueue_drain(icm->tq, &icm->bringup_task);
+	taskqueue_drain(icm->tq, &icm->teardown_task);
 	taskqueue_free(icm->tq);
 
 	if (icm->net != NULL)
