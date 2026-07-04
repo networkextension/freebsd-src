@@ -64,7 +64,11 @@ struct nhi_cmd_frame {
 #define CMD_RESP_COMPLETE	(1 << 3)
 #define CMD_RESP_OVERRUN	(1 << 4)
 	uint16_t		retries;
-	uint16_t		pdf;
+	uint16_t		pdf;		/* descriptor EOF (and SOF if sof==0) */
+	uint16_t		sof;		/* descriptor SOF; 0 => use pdf.
+					 * FRAME-mode data frames need SOF != EOF
+					 * (ThunderboltIP: SOF=FRAME_START,
+					 * EOF=FRAME_END). */
 	uint16_t		idx;
 
 	void			*context;

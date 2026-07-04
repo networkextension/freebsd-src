@@ -953,7 +953,13 @@ nhi_tx_enqueue(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 	desc->addr_hi = htole32(cmd->data_busaddr >> 32);
 	desc->eof_len = htole16((cmd->pdf << TX_BUFFER_DESC_EOF_SHIFT) |
 	    cmd->req_len);
-	desc->flags_sof = cmd->pdf | TX_BUFFER_DESC_IE | TX_BUFFER_DESC_RS;
+	/*
+	 * SOF defaults to the EOF pdf (control ring 0: SOF == EOF == pdf), but a
+	 * FRAME-mode data frame needs a distinct SOF (ThunderboltIP sends
+	 * SOF=FRAME_START, EOF=FRAME_END; the peer's RX ring filters on both).
+	 */
+	desc->flags_sof = (cmd->sof != 0 ? cmd->sof : cmd->pdf) |
+	    TX_BUFFER_DESC_IE | TX_BUFFER_DESC_RS;
 	desc->offset = 0;
 	desc->payload_time = 0;
 
