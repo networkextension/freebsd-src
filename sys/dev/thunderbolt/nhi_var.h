@@ -148,6 +148,7 @@ struct nhi_ring_pair {
 	struct callout		rxpoll_co;
 	bool			rxpoll_active;
 	bool			priv_tracker;	/* r->tracker was malloc'd here */
+	uint32_t		dbg_polls;	/* diag: poll counter (rate-limit) */
 };
 
 /*

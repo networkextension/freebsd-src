@@ -540,9 +540,15 @@ nhi_configure_ring(struct nhi_softc *sc, struct nhi_ring_pair *ring)
 	tb_debug(sc, DBG_INIT, "TX Ring %d TX_RING_SIZE= 0x%x\n",
 	    ring->ring_num, ring->tx_ring_depth);
 
-	/* Program the RX ring address and size */
+	/* Program the RX ring address and size.  Only RAW rings (ring 0) carry
+	 * the RX max-frame in [31:16]; FRAME-mode data rings size their buffers
+	 * per-descriptor and must leave it 0 - the proven nhi_icm data path sets
+	 * it only for !frame_mode, and setting it here starves the data ring. */
 	busaddr = ring->rx_ring_busaddr;
-	val = (ring->rx_buffer_size << 16) | ring->rx_ring_depth;
+	if (ring->frame_mode)
+		val = ring->rx_ring_depth;
+	else
+		val = (ring->rx_buffer_size << 16) | ring->rx_ring_depth;
 	nhi_write_reg(sc, NHI_RX_RING_ADDR_LO + idx, busaddr & 0xffffffff);
 	nhi_write_reg(sc, NHI_RX_RING_ADDR_HI + idx, busaddr >> 32);
 	nhi_write_reg(sc, NHI_RX_RING_SIZE + idx, val);
@@ -1419,9 +1425,24 @@ static void
 nhi_rxpoll_timer(void *arg)
 {
 	struct nhi_ring_pair *r = arg;
+	uint32_t pici;
+	uint16_t hw_pi;
 
 	if (!r->rxpoll_active)
 		return;
+	/*
+	 * Diagnostic (rate-limited to ~1/s): read the firmware's RX producer
+	 * index.  If it advances while a peer sends, the firmware IS DMAing
+	 * frames into this ring (loss is on our side); if it stays 0, the
+	 * firmware is not routing to this ring (APPROVE/hop/ring issue).
+	 */
+	if ((r->dbg_polls++ & 0x3ff) == 0) {
+		pici = nhi_read_reg(r->sc, r->rx_pici_reg);
+		hw_pi = (pici >> RX_RING_PI_SHIFT) & RX_RING_CI_MASK;
+		device_printf(r->sc->dev,
+		    "ring%d hw RX PI= %u (our pi=%u ci=%u pici=0x%08x)\n",
+		    r->ring_num, hw_pi, r->rx_pi, r->rx_ci, pici);
+	}
 	nhi_ring_process(r);
 	callout_reset(&r->rxpoll_co, 1, nhi_rxpoll_timer, r);
 }
