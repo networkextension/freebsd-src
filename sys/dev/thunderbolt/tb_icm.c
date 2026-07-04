@@ -50,6 +50,8 @@
 
 /* ICM protocol (firmware connection manager); not in the in-tree headers. */
 #define	ICM_DRIVER_READY		0x03
+/* #42: bound on post-DRIVER_READY software-replug kicks (x2s = ~30s window) */
+#define	NHI_ICM_XDKICK_MAX		15
 #define	 ICM_FLAGS_ERROR		(1u << 0)
 #define	 ICM_TR_SLEVEL_MASK		0x0007
 #define	 ICM_TR_PROTO_VER_SHIFT		4
@@ -114,6 +116,10 @@ struct tb_icm {
 	bool			login_sent, login_received;
 	u_int			login_tries;
 	u_int			logout_kicks;
+
+	/* #42: auto software-replug when the ICM skips XDOMAIN_CONNECTED */
+	struct task		xdkick_task;
+	u_int			xdkick_tries;
 };
 
 static void tb_icm_login_timer(void *);
@@ -302,6 +308,21 @@ tb_icm_install_tx_hop(struct tb_icm *icm)
 	DELAY(5000);
 	device_printf(icm->nsc->dev, "TX hop installed: NHI(7) HOPS[%d] -> "
 	    "port %u hop %u\n", ICM_DATA_TX_RING, out_port, icm->local_tx_hopid);
+}
+
+/* Taskqueue: no XDOMAIN_CONNECTED arrived (integrated MTL often skips it after a
+ * driver reload while the peer still believes the old session is up).  Send a
+ * software replug - PROPERTIES_CHANGED x2 to the directly-attached route - so the
+ * peer re-initiates and the ensuing XDOMAIN_CONNECTED / PROPERTIES_REQUEST
+ * bootstraps the session.  Runs in the sleepable taskqueue (the kick busy-waits
+ * ~40ms between packets, too long for the callout/softclock). */
+static void
+tb_icm_xdkick(void *arg, int pending __unused)
+{
+	struct tb_icm *icm = arg;
+
+	if (!icm->dying && !icm->has_peer)
+		tb_xdomain_kick(icm->xd, 1);
 }
 
 /* Taskqueue: LOGIN COMPLETE -> approve the tunnel, install the hop, bring up
@@ -529,6 +550,18 @@ tb_icm_login_timer(void *arg)
 
 	if (icm->dying)				/* teardown: never re-arm */
 		return;
+	if (!icm->has_peer) {
+		/* #42: no XDOMAIN_CONNECTED yet - software-replug the peer a
+		 * bounded number of times, then give up (a later fresh plug
+		 * notifies normally and takes the has_peer path below). */
+		if (icm->xdkick_tries < NHI_ICM_XDKICK_MAX) {
+			icm->xdkick_tries++;
+			taskqueue_enqueue(icm->tq, &icm->xdkick_task);
+			callout_reset(&icm->login_co, 2 * hz,
+			    tb_icm_login_timer, icm);
+		}
+		return;
+	}
 	if (icm->has_peer && !icm->paths_approved && !icm->login_sent &&
 	    icm->login_tries < 60) {
 		icm->login_tries++;
@@ -568,7 +601,7 @@ tb_icm_event_cb(void *context, union nhi_ring_desc *rdesc,
 		icm->peer_route_lo = le32dec(f + 44);
 		icm->has_peer = true;
 		icm->login_sent = icm->login_received = icm->paths_approved = false;
-		icm->login_tries = icm->logout_kicks = 0;
+		icm->login_tries = icm->logout_kicks = icm->xdkick_tries = 0;
 		tb_xdomain_set_peer(icm->xd, icm->peer_uuid, icm->local_uuid,
 		    icm->peer_route_hi, icm->peer_route_lo);
 		tbip_send_logout(icm);		/* reset a stale peer session */
@@ -614,6 +647,7 @@ tb_icm_init(struct nhi_softc *nsc, struct nhi_ring_pair *ring0,
 	callout_init(&icm->login_co, 1);
 	TASK_INIT(&icm->bringup_task, 0, tb_icm_bringup, icm);
 	TASK_INIT(&icm->teardown_task, 0, tb_icm_teardown, icm);
+	TASK_INIT(&icm->xdkick_task, 0, tb_icm_xdkick, icm);
 	icm->tq = taskqueue_create("tbicm", M_NOWAIT, taskqueue_thread_enqueue,
 	    &icm->tq);
 	if (icm->tq == NULL) {
@@ -647,6 +681,14 @@ tb_icm_init(struct nhi_softc *nsc, struct nhi_ring_pair *ring0,
 	tb_icm_gen_mac(icm);
 	if ((error = tbnet_create(nsc, icm->tbt_mac, &icm->net)) != 0)
 		goto fail_pdf;
+
+	/*
+	 * #42: start the software-replug loop.  On a fresh cable plug the ICM
+	 * sends XDOMAIN_CONNECTED and the login timer takes the has_peer path;
+	 * on a driver reload where the ICM stays silent, the timer kicks the
+	 * peer (bounded) until it re-initiates - no physical replug needed.
+	 */
+	callout_reset(&icm->login_co, hz, tb_icm_login_timer, icm);
 
 	*icmp = icm;
 	return (0);
@@ -692,6 +734,7 @@ tb_icm_fini(struct tb_icm *icm)
 	callout_drain(&icm->login_co);
 	taskqueue_drain(icm->tq, &icm->bringup_task);
 	taskqueue_drain(icm->tq, &icm->teardown_task);
+	taskqueue_drain(icm->tq, &icm->xdkick_task);
 	taskqueue_free(icm->tq);
 
 	if (icm->net != NULL)
