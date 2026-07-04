@@ -24,6 +24,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/kernel.h>
 #include <sys/bus.h>
 #include <sys/endian.h>
 #include <sys/gsb_crc32.h>
@@ -34,6 +35,7 @@
 
 #include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/nhi_var.h>
+#include <dev/thunderbolt/tb_xdomain.h>
 
 /*
  * XDomain / property-directory protocol constants (Apple/USB4 Inter-Domain
@@ -69,9 +71,8 @@
 /* PDF_XDOMAIN_REQ / PDF_XDOMAIN_RESP (0x06 / 0x07) come from nhi_reg.h.  Frames
  * on ring 0 use SOF==EOF==pdf (control), like the CM's config packets. */
 
-/* A service handler (e.g. the ThunderboltIP login) for non-discovery frames
- * that carry a service UUID instead of the XDomain discovery UUID. */
-typedef void (tb_xdomain_service_cb)(void *ctx, const uint8_t *frame, u_int len);
+/* tb_xdomain_service_cb (for non-discovery service-UUID frames) is in the
+ * public header. */
 
 struct tb_xdomain {
 	struct nhi_softc	*nsc;
@@ -168,7 +169,7 @@ xdp_put_text(uint32_t *b, u_int off, const char *s)
 		b[off + i] = xdp_word(s, strlen(s), i * 4);
 }
 
-void
+static void
 tb_xdomain_build_dir(struct tb_xdomain *xd)
 {
 	static const uint8_t net_uuid[16] = NHI_NET_DIR_UUID;

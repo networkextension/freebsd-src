@@ -44,6 +44,7 @@
 
 #include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/nhi_var.h>
+#include <dev/thunderbolt/if_tbt.h>
 
 /*
  * ThunderboltIP data-frame framing (Apple protocol; not in the USB4 spec).  A
