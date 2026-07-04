@@ -518,6 +518,20 @@ nhi_free_ring(struct nhi_ring_pair *r)
 {
 
 	tb_debug(r->sc, DBG_INIT, "Freeing ring %d resources\n", r->ring_num);
+
+	/*
+	 * Stop the RX poll callout before any teardown.  It re-arms itself and
+	 * calls nhi_ring_process(), which locks r->mtx - so if it fires after
+	 * mtx_destroy() below it panics with "mtx_lock() of destroyed mutex".
+	 * Clear rxpoll_active first so an in-flight timer returns without
+	 * re-arming, then drain.  Done here (not just in the stop path) so the
+	 * detach path (nhi_free_rings -> nhi_free_ring) is covered too.  Safe on
+	 * a never-armed callout (callout_init ran at ring creation), and no lock
+	 * is held here so callout_drain cannot deadlock against the timer.
+	 */
+	r->rxpoll_active = false;
+	callout_drain(&r->rxpoll_co);
+
 	nhi_deactivate_ring(r);
 
 	if (r->tx_ring_busaddr != 0) {
