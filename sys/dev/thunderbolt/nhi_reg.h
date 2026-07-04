@@ -205,7 +205,8 @@
 
 /*
  * In the USB4 spec this register is named Host Interface Control, and the
- * Interrupt Autoclear bit is documented at bit 17; the hardware uses bit 2.
+ * Interrupt Autoclear bit is documented at bit 17; the Intel NHI hardware
+ * implements it at bit 2, which is what is used here.
  */
 #define NHI_DMA_MISC			0x39864
 #define DMA_MISC_INT_AUTOCLEAR		(1 << 2)
