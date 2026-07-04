@@ -90,6 +90,7 @@ struct tb_icm {
 	struct taskqueue	*tq;
 	struct task		bringup_task;
 	struct callout		login_co;
+	bool			dying;		/* teardown: stop callout re-arm */
 
 	/* synchronous ICM req/resp capture (waiter <- CM_RESP callback) */
 	bool			waiting;
@@ -169,10 +170,10 @@ tb_icm_request(struct tb_icm *icm, uint8_t code, const uint8_t *req, u_int len,
 	}
 
 	mtx_lock(&icm->lock);
-	while (icm->waiting)
+	while (icm->waiting && !icm->dying)
 		if (msleep(icm, &icm->lock, 0, "tbicm", timo_ms * hz / 1000) != 0)
 			break;			/* timeout */
-	if (icm->waiting) {			/* timed out */
+	if (icm->waiting) {			/* timed out or dying */
 		icm->waiting = false;
 		mtx_unlock(&icm->lock);
 		return (ETIMEDOUT);
@@ -307,7 +308,7 @@ tb_icm_bringup(void *arg, int pending __unused)
 {
 	struct tb_icm *icm = arg;
 
-	if (icm->paths_approved || !icm->has_peer)
+	if (icm->dying || icm->paths_approved || !icm->has_peer)
 		return;
 	if (tb_icm_approve_xdomain(icm) != 0) {
 		device_printf(icm->nsc->dev, "bring-up: APPROVE failed\n");
@@ -503,6 +504,8 @@ tb_icm_login_timer(void *arg)
 {
 	struct tb_icm *icm = arg;
 
+	if (icm->dying)				/* teardown: never re-arm */
+		return;
 	if (icm->has_peer && !icm->paths_approved && !icm->login_sent &&
 	    icm->login_tries < 60) {
 		icm->login_tries++;
@@ -547,7 +550,9 @@ tb_icm_event_cb(void *context, union nhi_ring_desc *rdesc,
 		tb_xdomain_set_peer(icm->xd, icm->peer_uuid, icm->local_uuid,
 		    icm->peer_route_hi, icm->peer_route_lo);
 		tbip_send_logout(icm);		/* reset a stale peer session */
-		callout_reset(&icm->login_co, hz / 2, tb_icm_login_timer, icm);
+		if (!icm->dying)
+			callout_reset(&icm->login_co, hz / 2,
+			    tb_icm_login_timer, icm);
 		device_printf(icm->nsc->dev, "xdomain connected: route %x:%x\n",
 		    icm->peer_route_hi, icm->peer_route_lo);
 		break;
@@ -633,16 +638,32 @@ tb_icm_fini(struct tb_icm *icm)
 {
 	struct nhi_dispatch txd[1], rxd[3];
 
-	callout_drain(&icm->login_co);
-	if (icm->net != NULL)
-		tbnet_detach(icm->net);
+	/*
+	 * Teardown order matters.  (1) Mark dying and wake any req/resp waiter
+	 * so the login callout and the bring-up task stop re-arming/blocking -
+	 * without this, callout_drain() on a self-rescheduling callout hangs
+	 * forever (it hung a reboot).  (2) Stop ring-0 dispatch (CM_RESP/EVENT
+	 * and XDomain) so no callback fires during teardown.  (3) Drain the
+	 * callout and the bring-up task.  (4) Tear down the net + free.
+	 */
+	mtx_lock(&icm->lock);
+	icm->dying = true;
+	wakeup(icm);
+	mtx_unlock(&icm->lock);
+
 	txd[0].pdf = 0; txd[0].cb = NULL; txd[0].context = NULL;
 	rxd[0].pdf = PDF_CM_RESP;  rxd[0].cb = tb_icm_resp_cb;  rxd[0].context = icm;
 	rxd[1].pdf = PDF_CM_EVENT; rxd[1].cb = tb_icm_event_cb; rxd[1].context = icm;
 	rxd[2].pdf = 0; rxd[2].cb = NULL; rxd[2].context = NULL;
 	nhi_deregister_pdf(icm->ring0, txd, rxd);
 	tb_xdomain_fini(icm->xd);
+
+	callout_drain(&icm->login_co);
+	taskqueue_drain(icm->tq, &icm->bringup_task);
 	taskqueue_free(icm->tq);
+
+	if (icm->net != NULL)
+		tbnet_detach(icm->net);
 	mtx_destroy(&icm->lock);
 	free(icm, M_NHI);
 }
