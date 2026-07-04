@@ -215,6 +215,8 @@ struct nhi_softc {
 
 	struct intr_config_hook	ich;
 
+	struct tb_icm		*icm;	/* ICM connection manager (ICM mode) */
+
 	uint8_t			uuid[16];
 	uint8_t			lc_uuid[16];
 };

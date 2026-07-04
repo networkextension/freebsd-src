@@ -49,6 +49,23 @@
 #define	DEVICE_AR_LP_NHI	0x15bf
 #define DEVICE_ICL_NHI_0	0x8a17
 #define DEVICE_ICL_NHI_1	0x8a0d
+#define	DEVICE_MTL_NHI_0	0x7ec2	/* Meteor Lake-P integrated USB4 NHI0 */
+#define	DEVICE_MTL_NHI_1	0x7ec3	/* Meteor Lake-P integrated USB4 NHI1 */
+
+/*
+ * Vendor-specific force-power, in PCI *config* space (Ice Lake onward,
+ * including Meteor Lake).  An integrated controller stays powered off until the
+ * host asserts force-power; the firmware (ICM) will not answer ring-0 commands
+ * until it reports ready.  The in-tree driver otherwise relies on the ACPI-WMI
+ * method (nhi_wmi.c); these are the direct VS-cap registers our ICM path uses.
+ */
+#define	NHI_VS_CAP_9			0xc8	/* firmware status */
+#define	 NHI_VS_CAP_9_FW_READY		(1u << 31)
+#define	NHI_VS_CAP_22			0xfc	/* power control */
+#define	 NHI_VS_CAP_22_FORCE_POWER	(1u << 1)
+#define	 NHI_VS_CAP_22_DMA_DELAY_SHIFT	24
+#define	 NHI_VS_CAP_22_DMA_DELAY_MASK	0xff000000u
+#define	 NHI_VS_CAP_22_DMA_DELAY_VAL	0x22
 
 #define VENDOR_AMD		0x1022
 #define DEVICE_PINK_SARDINE_0	0x1668

@@ -59,6 +59,8 @@
 #include <dev/thunderbolt/tbcfg_reg.h>
 #include <dev/thunderbolt/router_var.h>
 #include <dev/thunderbolt/tb_dev.h>
+#include <dev/thunderbolt/tb_icm.h>
+#include <dev/pci/pcivar.h>
 #include "tb_if.h"
 
 static int nhi_alloc_ring(struct nhi_softc *, int, int, int,
@@ -235,6 +237,58 @@ nhi_outmail_cmd(struct nhi_softc *sc, uint32_t *val)
 	return (0);
 }
 
+/* Is this an integrated controller that runs the firmware ICM (ICM mode)? */
+static bool
+nhi_is_icm(struct nhi_softc *sc)
+{
+	uint16_t dev = pci_get_device(sc->dev);
+
+	return (dev == DEVICE_MTL_NHI_0 || dev == DEVICE_MTL_NHI_1);
+}
+
+/*
+ * Force-power an integrated (Meteor Lake) controller via the vendor-specific
+ * PCI-config registers and wait for firmware-ready.  Without this the on-die
+ * controller stays powered off and the ICM never answers ring 0.  Ported from
+ * the standalone nhi_icm driver; the in-tree driver otherwise uses the ACPI-WMI
+ * force-power path (nhi_wmi.c).
+ */
+static int
+nhi_force_power(struct nhi_softc *sc)
+{
+	uint32_t vs22, vs9;
+	int retries;
+
+	vs22 = pci_read_config(sc->dev, NHI_VS_CAP_22, 4);
+	vs22 &= ~NHI_VS_CAP_22_DMA_DELAY_MASK;
+	vs22 |= (NHI_VS_CAP_22_DMA_DELAY_VAL << NHI_VS_CAP_22_DMA_DELAY_SHIFT);
+	vs22 |= NHI_VS_CAP_22_FORCE_POWER;
+	pci_write_config(sc->dev, NHI_VS_CAP_22, vs22, 4);
+
+	for (retries = 350; retries > 0; retries--) {
+		vs9 = pci_read_config(sc->dev, NHI_VS_CAP_9, 4);
+		if ((vs9 & NHI_VS_CAP_9_FW_READY) != 0) {
+			tb_printf(sc, "force-power: FW ready after %d ms\n",
+			    (350 - retries) * 3);
+			return (0);
+		}
+		DELAY(3000);
+	}
+	tb_printf(sc, "force-power: FW not ready (VS_CAP_9=0x%08x)\n", vs9);
+	return (ETIMEDOUT);
+}
+
+/* ICM-mode init: config hook fires once interrupts are live -> DRIVER_READY. */
+static void
+nhi_icm_post_init(void *arg)
+{
+	struct nhi_softc *sc = arg;
+
+	if (tb_icm_init(sc, sc->ring0, &sc->icm) != 0)
+		tb_printf(sc, "ICM init failed\n");
+	config_intrhook_disestablish(&sc->ich);
+}
+
 int
 nhi_attach(struct nhi_softc *sc)
 {
@@ -245,6 +299,11 @@ nhi_attach(struct nhi_softc *sc)
 		return (error);
 
 	mtx_init(&sc->nhi_mtx, "nhimtx", "NHI Control Mutex", MTX_DEF);
+
+	/* Integrated controllers (MTL) must be force-powered before the
+	 * firmware answers; do it before touching the host-caps register. */
+	if (nhi_is_icm(sc))
+		(void)nhi_force_power(sc);
 
 	/*
 	 * Get the number of TX/RX paths.  This sizes some of the register
@@ -273,10 +332,24 @@ nhi_attach(struct nhi_softc *sc)
 	if (error == 0)
 		error = tbdev_add_interface(sc);
 
-	error = hcm_attach(sc);
-
-	if (error == 0)
-		error = nhi_init(sc);
+	/*
+	 * Connection-manager selection.  Integrated ICM controllers run the
+	 * firmware CM: set the DMA interrupt auto-ACK and defer DRIVER_READY to
+	 * a config hook (it needs live interrupts for the CM_RESP callback), and
+	 * skip the HCM router walk entirely.  Everything else runs the in-tree
+	 * software CM (HCM).
+	 */
+	if (error == 0 && nhi_is_icm(sc)) {
+		val = nhi_read_reg(sc, NHI_DMA_MISC);
+		nhi_write_reg(sc, NHI_DMA_MISC, val | DMA_MISC_INT_AUTOCLEAR);
+		sc->ich.ich_func = nhi_icm_post_init;
+		sc->ich.ich_arg = sc;
+		error = config_intrhook_establish(&sc->ich);
+	} else {
+		error = hcm_attach(sc);
+		if (error == 0)
+			error = nhi_init(sc);
+	}
 
 	return (error);
 }
@@ -284,10 +357,15 @@ nhi_attach(struct nhi_softc *sc)
 int
 nhi_detach(struct nhi_softc *sc)
 {
-	hcm_detach(sc);
+	if (sc->icm != NULL) {
+		tb_icm_fini(sc->icm);
+		sc->icm = NULL;
+	} else {
+		hcm_detach(sc);
 
-	if (sc->root_rsc != NULL)
-		tb_router_detach(sc->root_rsc);
+		if (sc->root_rsc != NULL)
+			tb_router_detach(sc->root_rsc);
+	}
 
 	tbdev_remove_interface(sc);
 
