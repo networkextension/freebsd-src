@@ -252,13 +252,21 @@ nhi_outmail_cmd(struct nhi_softc *sc, uint32_t *val)
 	return (0);
 }
 
-/* Is this an integrated controller that runs the firmware ICM (ICM mode)? */
+/*
+ * Does this controller run the firmware ICM (Internal Connection Manager)?
+ * Runtime probe of the always-on FW status register (bit 0 = ICM/CM firmware
+ * enabled), which is readable before force-power - unlike the OUTMAIL opmode,
+ * which reads SAFE until the CM is woken by force-power + DRIVER_READY.  This
+ * replaces a PCI device-ID whitelist so every ICM-capable controller (Meteor
+ * Lake, Ice Lake, Tiger Lake, AMD Pink Sardine, ...) auto-selects the ICM path,
+ * while native-USB4 controllers (bit clear) fall through to hcm_attach.  Stable
+ * across attach, so both call sites (the force-power gate and the CM-selection
+ * branch) return the same value.
+ */
 static bool
 nhi_is_icm(struct nhi_softc *sc)
 {
-	uint16_t dev = pci_get_device(sc->dev);
-
-	return (dev == DEVICE_MTL_NHI_0 || dev == DEVICE_MTL_NHI_1);
+	return ((nhi_read_reg(sc, TBT_FW_STATUS) & FWSTATUS_ENABLE) != 0);
 }
 
 /*
@@ -315,8 +323,16 @@ nhi_attach(struct nhi_softc *sc)
 
 	mtx_init(&sc->nhi_mtx, "nhimtx", "NHI Control Mutex", MTX_DEF);
 
-	/* Integrated controllers (MTL) must be force-powered before the
-	 * firmware answers; do it before touching the host-caps register. */
+	/*
+	 * Connection-manager selection is firmware-driven (nhi_is_icm reads the
+	 * FW status register).  Log it, then force-power ICM controllers before
+	 * touching the host-caps register: integrated parts keep the on-die CM
+	 * powered down until asserted, and the firmware will not answer ring 0
+	 * (DRIVER_READY) until then.
+	 */
+	tb_printf(sc, "icm=%s (fw_status=0x%08x)\n",
+	    nhi_is_icm(sc) ? "present" : "absent",
+	    nhi_read_reg(sc, TBT_FW_STATUS));
 	if (nhi_is_icm(sc))
 		(void)nhi_force_power(sc);
 
