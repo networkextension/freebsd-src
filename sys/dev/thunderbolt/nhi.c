@@ -84,7 +84,7 @@ static int nhi_init(struct nhi_softc *);
  * (per-ring MSI-X is unreliable on this hardware), so we mirror that model but
  * default lower and use callout_reset_sbt for sub-ms resolution (a plain
  * callout is tick-granular, ~1ms, which rate-limits sustained RX/E2E credit
- * return).  Tunable: hw.nhi.rxpoll_us.
+ * return).  Tunable: hw.nhi_rxpoll_us.
  */
 static int nhi_rxpoll_us = 250;
 SYSCTL_INT(_hw, OID_AUTO, nhi_rxpoll_us, CTLFLAG_RWTUN, &nhi_rxpoll_us, 0,
@@ -100,6 +100,10 @@ MALLOC_DEFINE(M_NHI, "nhi", "nhi driver memory");
 #ifndef NHI_DEBUG_LEVEL
 #define NHI_DEBUG_LEVEL 0
 #endif
+
+/* Force-power poll: NHI_FORCE_POWER_RETRIES x 3ms DELAY = ~1.05s max wait for
+ * the controller firmware to report FW_READY (it short-circuits once ready). */
+#define NHI_FORCE_POWER_RETRIES 350
 
 void
 nhi_get_tunables(struct nhi_softc *sc)
@@ -181,6 +185,7 @@ nhi_free_tx_frame(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
  * Response is either good, error, or timeout.  Commands that return data
  * do so by reading OUTMAILDATA.
  */
+/* Unused today; kept as the SETMODE mailbox primitive for future use. */
 int
 nhi_inmail_cmd(struct nhi_softc *sc, uint32_t cmd, uint32_t data)
 {
@@ -242,6 +247,7 @@ nhi_inmail_cmd(struct nhi_softc *sc, uint32_t cmd, uint32_t data)
 /*
  * Pull command status and data from the firmware mailbox.
  */
+/* Unused today; kept as the opmode/OUTMAIL read primitive for future use. */
 int
 nhi_outmail_cmd(struct nhi_softc *sc, uint32_t *val)
 {
@@ -288,11 +294,11 @@ nhi_force_power(struct nhi_softc *sc)
 	vs22 |= NHI_VS_CAP_22_FORCE_POWER;
 	pci_write_config(sc->dev, NHI_VS_CAP_22, vs22, 4);
 
-	for (retries = 350; retries > 0; retries--) {
+	for (retries = NHI_FORCE_POWER_RETRIES; retries > 0; retries--) {
 		vs9 = pci_read_config(sc->dev, NHI_VS_CAP_9, 4);
 		if ((vs9 & NHI_VS_CAP_9_FW_READY) != 0) {
 			tb_printf(sc, "force-power: FW ready after %d ms\n",
-			    (350 - retries) * 3);
+			    (NHI_FORCE_POWER_RETRIES - retries) * 3);
 			return (0);
 		}
 		DELAY(3000);

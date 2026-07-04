@@ -131,7 +131,8 @@ nhi_pci_attach(device_t dev)
 			sc->ufp = devclass_get_device(dc, device_get_unit(dev));
 	}
 	if (sc->ufp == NULL)
-		tb_printf(sc, "Cannot find Upstream Facing Port\n");
+		tb_debug(sc, DBG_INIT,
+		    "No Upstream Facing Port (expected on integrated ICM)\n");
 	else
 		tb_printf(sc, "Upstream Facing Port is %s\n",
 		    device_get_nameunit(sc->ufp));

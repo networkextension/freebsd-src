@@ -36,6 +36,7 @@
 #include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/nhi_var.h>
 #include <dev/thunderbolt/tb_xdomain.h>
+#include <dev/thunderbolt/tb_debug.h>
 
 /*
  * XDomain / property-directory protocol constants (Apple/USB4 Inter-Domain
@@ -295,7 +296,7 @@ tb_xdp_dispatch(struct tb_xdomain *xd, const uint8_t *f, u_int len)
 
 	rhi = req_rhi & 0x7fffffff;
 	rlo = req_rlo;
-	device_printf(xd->nsc->dev,
+	tb_debug(xd->nsc, DBG_INIT,
 	    "xdomain rx type=%u len=%u reqroute=%x:%x peerroute=%x:%x\n",
 	    type, len, req_rhi, req_rlo, rhi, rlo);
 
@@ -325,7 +326,7 @@ tb_xdp_dispatch(struct tb_xdomain *xd, const uint8_t *f, u_int len)
 		off = le32dec(f + 64) & 0xffff;
 		rlen = xdp_props_response(xd, r, rhi, rlo, length_sn, f + 32, off);
 		tb_xdp_ctl_tx(xd, PDF_XDOMAIN_RESP, r, rlen);
-		device_printf(xd->nsc->dev,
+		tb_debug(xd->nsc, DBG_INIT,
 		    "xdomain: PROPERTIES_REQUEST off=%u -> %u bytes\n", off, rlen);
 		break;
 	case NHI_XDP_PROPERTIES_CHANGED_REQUEST:
@@ -336,7 +337,7 @@ tb_xdp_dispatch(struct tb_xdomain *xd, const uint8_t *f, u_int len)
 	case NHI_XDP_PROPERTIES_CHANGED_RESPONSE:
 		break;
 	default:
-		device_printf(xd->nsc->dev, "xdomain: unhandled type=%u len=%u\n",
+		tb_debug(xd->nsc, DBG_INIT, "xdomain: unhandled type=%u len=%u\n",
 		    type, len);
 		break;
 	}

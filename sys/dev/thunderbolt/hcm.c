@@ -212,10 +212,12 @@ hcm_cfg_task(void *arg, int pending)
 			newr.hi = rsc->route.hi;
 			newr.lo = rsc->route.lo | (i << rsc->depth * 8);
 
-			tb_printf(hcm, "want to add router at 0x%08x%08x\n",
+			tb_debug(hcm, DBG_HCM, "want to add router at 0x%08x%08x\n",
 			    newr.hi, newr.lo);
 			error = tb_router_attach(rsc, newr);
-			tb_printf(rsc, "tb_router_attach returned %d\n", error);
+			if (error != 0)
+				tb_printf(rsc, "tb_router_attach failed: %d\n",
+				    error);
 		}
 	}
 
