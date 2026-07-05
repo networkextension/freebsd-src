@@ -1552,6 +1552,15 @@ nhi_ring_process(struct nhi_ring_pair *r)
 		    "Writing new RX PICI= 0x%08x\n", val);
 		nhi_write_reg(sc, r->rx_pici_reg, val);
 	}
+
+	/*
+	 * NAPI-style batch end: after draining the whole RX ring, let the
+	 * client flush a coalesced delivery (LRO) in one shot.  Runs in the
+	 * same (unlocked) context as the per-frame rx callbacks above, so it
+	 * may call into the stack.  Only when we actually consumed frames.
+	 */
+	if (r->rx_batch_cb != NULL && r->rx_ci != old_ci)
+		r->rx_batch_cb(r->rx_batch_ctx);
 }
 
 /*

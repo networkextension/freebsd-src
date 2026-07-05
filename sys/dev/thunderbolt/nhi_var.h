@@ -137,6 +137,14 @@ struct nhi_ring_pair {
 	uint16_t		eof_mask;	/* RX end-of-frame PDF bitmap */
 
 	/*
+	 * Optional per-batch RX hook: nhi_ring_process() calls this once after
+	 * draining all pending RX frames, so the client can flush a batched
+	 * delivery (LRO) in one shot instead of per frame (NAPI-style).
+	 */
+	void			(*rx_batch_cb)(void *);
+	void			*rx_batch_ctx;
+
+	/*
 	 * RX poll fallback.  MSI-X allocation is flaky on some hosts (Meteor
 	 * Lake advertises 16 vectors but pci_alloc_msix fails, so the driver
 	 * runs on 2 MSI vectors).  A ring whose number is >= msix_count gets no

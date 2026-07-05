@@ -41,6 +41,10 @@
 #include <net/if_types.h>
 #include <net/ethernet.h>
 #include <net/vnet.h>
+#include <netinet/in.h>
+#include <netinet/in_systm.h>
+#include <netinet/ip.h>
+#include <netinet/tcp_lro.h>
 
 #include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/nhi_var.h>
@@ -81,6 +85,11 @@ struct tbnet_softc {
 	uint16_t		rx_id;
 	u_int			rx_count;
 	u_int			rx_index;
+
+	/* LRO: coalesce TCP segments in the RX poll, flush once per batch
+	 * (the FreeBSD equivalent of Linux's napi_gro_receive). */
+	struct lro_ctrl		lro;
+	bool			lro_ok;
 };
 
 static int	tbnet_transmit(if_t, struct mbuf *);
@@ -88,6 +97,7 @@ static void	tbnet_qflush(if_t);
 static void	tbnet_init(void *);
 static int	tbnet_ioctl(if_t, u_long, caddr_t);
 static void	tbnet_rx_cb(void *, union nhi_ring_desc *, struct nhi_cmd_frame *);
+static void	tbnet_rx_flush(void *);
 
 /* Drop any half-reassembled RX packet. */
 static void
@@ -142,6 +152,18 @@ tbnet_create(struct nhi_softc *nsc, const uint8_t *mac, struct tbnet_softc **tsp
 	/* Interface exists but the link is down until a peer logs in. */
 	if_setdrvflagbits(ifp, 0, IFF_DRV_RUNNING);
 	if_link_state_change(ifp, LINK_STATE_DOWN);
+
+	/*
+	 * LRO: coalesce received TCP segments before the stack (the FreeBSD
+	 * equivalent of Linux thunderbolt-net's napi_gro_receive - the main
+	 * lever over our per-packet if_input path).  Best-effort: on failure
+	 * we fall back to per-packet delivery.
+	 */
+	if (tcp_lro_init_args(&ts->lro, ifp, 8, 0) == 0) {
+		ts->lro_ok = true;
+		if_setcapabilitiesbit(ifp, IFCAP_LRO, 0);
+		if_setcapenablebit(ifp, IFCAP_LRO, 0);
+	}
 
 	*tsp = ts;
 	return (0);
@@ -205,6 +227,12 @@ tbnet_connect(struct tbnet_softc *ts)
 	if ((error = nhi_ring_start(ts->rxring)) != 0)
 		goto fail_pdf;
 
+	/* NAPI-style batch end: flush LRO once after each RX ring drain. */
+	if (ts->lro_ok) {
+		ts->rxring->rx_batch_cb = tbnet_rx_flush;
+		ts->rxring->rx_batch_ctx = ts;
+	}
+
 	if_setdrvflagbits(ts->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
 	if_link_state_change(ts->ifp, LINK_STATE_UP);
 	return (0);
@@ -262,6 +290,10 @@ tbnet_destroy(struct tbnet_softc *ts)
 		CURVNET_RESTORE();
 		if_free(ts->ifp);
 		ts->ifp = NULL;
+	}
+	if (ts->lro_ok) {
+		tcp_lro_free(&ts->lro);
+		ts->lro_ok = false;
 	}
 	mtx_destroy(&ts->lock);
 	free(ts, M_NHI);
@@ -436,10 +468,45 @@ tbnet_reass(struct tbnet_softc *ts, const uint8_t *payload, u_int len,
 }
 
 /*
+ * Deliver one reassembled Ethernet frame.  Offer it to LRO first to coalesce
+ * TCP segments; tcp_lro_rx() can itself flush->if_input when it evicts an entry,
+ * so hold the net epoch across it and the non-LRO fallback.  Coalesced segments
+ * are pushed up in one shot by tbnet_rx_flush() at the end of the ring drain.
+ */
+static void
+tbnet_rx_deliver(struct tbnet_softc *ts, struct mbuf *m)
+{
+	struct epoch_tracker et;
+
+	NET_EPOCH_ENTER(et);
+	if (!ts->lro_ok || tcp_lro_rx(&ts->lro, m, 0) != 0)
+		if_input(ts->ifp, m);
+	NET_EPOCH_EXIT(et);
+}
+
+/*
+ * Batch-end hook (nhi_ring_pair.rx_batch_cb): the transport calls this once
+ * after draining the whole RX ring, so we flush all coalesced LRO segments in a
+ * single pass - the NAPI/GRO shape that amortizes the per-packet stack cost.
+ */
+static void
+tbnet_rx_flush(void *context)
+{
+	struct tbnet_softc *ts = context;
+	struct epoch_tracker et;
+
+	if (!ts->lro_ok)
+		return;
+	NET_EPOCH_ENTER(et);
+	tcp_lro_flush_all(&ts->lro);
+	NET_EPOCH_EXIT(et);
+}
+
+/*
  * RX PDF callback (interrupt context): the transport hands us a completed data
  * frame in cmd->data (reuse-in-place - copy out before returning).  Parse the
  * little-endian header, validate, and either fast-path a single-frame packet or
- * reassemble, then ether_input inside the network epoch.
+ * reassemble, then hand the mbuf to tbnet_rx_deliver (LRO/if_input).
  *
  * Reassembly state is touched only here and RX completions are serialized per
  * ring, so no lock is needed for it; we hold no lock across if_input (the stack
@@ -451,7 +518,6 @@ tbnet_rx_cb(void *context, union nhi_ring_desc *rdesc,
 {
 	struct tbnet_softc *ts = context;
 	struct nhi_rx_post_desc *desc = (struct nhi_rx_post_desc *)rdesc;
-	struct epoch_tracker et;
 	if_t ifp = ts->ifp;
 	const uint8_t *frame = (const uint8_t *)cmd->data;
 	const uint8_t *payload;
@@ -473,23 +539,20 @@ tbnet_rx_cb(void *context, union nhi_ring_desc *rdesc,
 	}
 	payload = frame + TBNET_HDR_LEN;
 
-	NET_EPOCH_ENTER(et);
 	if (count == 1) {			/* fast path: whole packet */
 		m = m_devget(__DECONST(char *, payload), fsize, 0, ifp, NULL);
 		if (m == NULL) {
 			if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
-		} else {
-			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
-			if_inc_counter(ifp, IFCOUNTER_IBYTES, fsize);
-			if_input(ifp, m);
+			return;
 		}
+		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+		if_inc_counter(ifp, IFCOUNTER_IBYTES, fsize);
 	} else {
 		m = tbnet_reass(ts, payload, fsize, index, id, count);
-		if (m != NULL) {
-			if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
-			if_inc_counter(ifp, IFCOUNTER_IBYTES, m->m_pkthdr.len);
-			if_input(ifp, m);
-		}
+		if (m == NULL)
+			return;
+		if_inc_counter(ifp, IFCOUNTER_IPACKETS, 1);
+		if_inc_counter(ifp, IFCOUNTER_IBYTES, m->m_pkthdr.len);
 	}
-	NET_EPOCH_EXIT(et);
+	tbnet_rx_deliver(ts, m);
 }
