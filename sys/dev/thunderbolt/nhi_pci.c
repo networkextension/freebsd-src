@@ -60,6 +60,12 @@
 #include <dev/thunderbolt/tb_debug.h>
 #include "tb_if.h"
 
+/* USB4 host-interface PCI programming interface (class 0x0c, subclass 0x03).
+ * Defined in FreeBSD 16's pcireg.h; shim for building on 15.x. */
+#ifndef PCIP_SERIALBUS_USB_USB4
+#define	PCIP_SERIALBUS_USB_USB4	0x40
+#endif
+
 static int	nhi_pci_probe(device_t);
 static int	nhi_pci_attach(device_t);
 static int	nhi_pci_detach(device_t);

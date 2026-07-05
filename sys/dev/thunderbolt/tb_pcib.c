@@ -68,6 +68,17 @@
 #include <dev/thunderbolt/tb_debug.h>
 #include "tb_if.h"
 
+/* is_pci_device() was added to the PCI KPI in FreeBSD 16; shim for 15.x. */
+#if __FreeBSD_version < 1600000
+static bool
+is_pci_device(device_t dev)
+{
+	device_t parent = device_get_parent(dev);
+
+	return (parent != NULL && strcmp(device_get_name(parent), "pci") == 0);
+}
+#endif
+
 static int	tb_pcib_probe(device_t);
 static int	tb_pcib_attach(device_t);
 static int	tb_pcib_detach(device_t);
