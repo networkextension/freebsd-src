@@ -1,0 +1,13 @@
+# GENERIC-16K — arm64 GENERIC for a 16K-page kernel (Neoverse N1 / Ampere Altra).
+#
+# Same as GENERIC, minus Hyper-V: dev/hyperv/vmbus/vmbus_reg.h hardcodes
+# CTASSERT(sizeof(struct vmbus_{mnf,bufring}) == PAGE_SIZE) with the Hyper-V
+# ring structs fixed at 4096 bytes, so it fails to compile when PAGE_SIZE=16384.
+# Hyper-V is irrelevant on bare-metal Ampere server hardware, so we drop it.
+# Requires sys/arm64/include/param.h PAGE_SHIFT = PAGE_SHIFT_16K (see 16k.sh).
+
+include		GENERIC
+ident		GENERIC-16K
+
+nodevice	hyperv		# 4K-page ABI assumption in vmbus_reg.h; N/A on N1
+makeoptions	WITHOUT_MODULES="hyperv"	# also drop it from the module build

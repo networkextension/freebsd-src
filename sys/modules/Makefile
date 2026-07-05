@@ -717,7 +717,7 @@ SUBDIR+=	tests
 .if ${MK_USB} != "no" || defined(ALL_MODULES)
 _rtwn_usb=	rtwn_usb
 _usb=		usb
-. if ${MACHINE_CPUARCH} == "amd64"
+. if ${MACHINE_CPUARCH} == "amd64" || ${MACHINE_CPUARCH} == "aarch64"
 _thunderbolt=	thunderbolt
 . endif
 .endif
