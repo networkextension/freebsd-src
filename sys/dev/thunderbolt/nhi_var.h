@@ -184,6 +184,7 @@ struct nhi_softc {
 	device_t		dev;
 	device_t		ufp;
 	u_int			debug;
+	u_int			quirks;		/* NHI_QUIRK_* per chip family */
 	u_int			hwflags;
 #define NHI_TYPE_UNKNOWN	0x00
 #define NHI_TYPE_USB4		0x0f

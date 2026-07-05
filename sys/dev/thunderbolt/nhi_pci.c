@@ -97,6 +97,26 @@ static driver_t nhi_pci_driver = {
 DRIVER_MODULE_ORDERED(nhi, pci, nhi_pci_driver, NULL, NULL,
     SI_ORDER_ANY);
 
+/*
+ * Chip-family quirks, keyed on PCI device id (see the device-matrix note).
+ * TB3/legacy NHIs (Titan/Alpine Ridge) have a different BAR0 register map and
+ * force-power window than the integrated USB4 NHIs this driver drives.
+ */
+static u_int
+nhi_device_quirks(uint16_t dev)
+{
+	switch (dev) {
+	case DEVICE_TR_NHI:
+	case DEVICE_AR_2C_NHI:
+	case DEVICE_AR_DP_B_NHI:
+	case DEVICE_AR_DP_C_NHI:
+	case DEVICE_AR_LP_NHI:
+		return (NHI_QUIRK_TB3);
+	default:
+		return (0);
+	}
+}
+
 static int
 nhi_pci_probe(device_t dev)
 {
@@ -106,6 +126,16 @@ nhi_pci_probe(device_t dev)
 	    && (pci_get_subclass(dev) == PCIS_SERIALBUS_USB)
 	    && (pci_get_progif(dev) == PCIP_SERIALBUS_USB_USB4)) {
 		device_set_desc(dev, "Generic USB4 NHI");
+		return (BUS_PROBE_DEFAULT);
+	}
+	/*
+	 * TB3/legacy NHI (Titan/Alpine Ridge).  Its PCI class is 0x088000 (generic
+	 * system peripheral) which is far too broad to match on, so match the
+	 * specific device id.  nhi_attach classifies it via NHI_QUIRK_TB3.
+	 */
+	if (pci_get_vendor(dev) == VENDOR_INTEL &&
+	    pci_get_device(dev) == DEVICE_TR_NHI) {
+		device_set_desc(dev, "Titan Ridge TB3 NHI");
 		return (BUS_PROBE_DEFAULT);
 	}
 	return (ENXIO);
@@ -124,6 +154,21 @@ nhi_pci_attach(device_t dev)
 	sc->dev = dev;
 	sc->hwflags = NHI_TYPE_USB4;
 	nhi_get_tunables(sc);
+
+	/*
+	 * Classify BEFORE touching the hardware.  A TB3/legacy NHI (Titan/Alpine
+	 * Ridge) has a different register map + force-power path than the USB4 NHI
+	 * this driver drives, and on a Mac the SMC/firmware co-manages the
+	 * controller - mapping its BAR or grabbing its MSI-X below would wedge the
+	 * machine.  The probe already set the desc so it is recognised; decline
+	 * here, before any resource allocation, until TB3 support exists.
+	 */
+	sc->quirks = nhi_device_quirks(pci_get_device(dev));
+	if ((sc->quirks & NHI_QUIRK_TB3) != 0) {
+		device_printf(dev, "TB3/legacy NHI (dev 0x%04x): not yet supported; "
+		    "declining before touching the controller\n", pci_get_device(dev));
+		return (ENXIO);
+	}
 
 	tb_debug(sc, DBG_INIT|DBG_FULL, "busmaster status was %s\n",
 	    (pci_read_config(dev, PCIR_COMMAND, 2) & PCIM_CMD_BUSMASTEREN)

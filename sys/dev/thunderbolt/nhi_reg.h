@@ -51,6 +51,14 @@
 #define DEVICE_ICL_NHI_1	0x8a0d
 #define	DEVICE_MTL_NHI_0	0x7ec2	/* Meteor Lake-P integrated USB4 NHI0 */
 #define	DEVICE_MTL_NHI_1	0x7ec3	/* Meteor Lake-P integrated USB4 NHI1 */
+#define	DEVICE_TR_NHI		0x15eb	/* Titan Ridge JHL7540 TB3 NHI (discrete) */
+
+/*
+ * Per-controller quirks, keyed on chip family (see the device-matrix note).
+ * Default 0 = the integrated USB4 NHI this driver's BAR0 register map and VSEC
+ * force-power target.
+ */
+#define	NHI_QUIRK_TB3		(1u << 0)  /* TB3/legacy (Alpine/Titan Ridge): different BAR0 register map + force-power window; the USB4 offsets in this header do NOT apply */
 
 /*
  * Vendor-specific force-power, in PCI *config* space (Ice Lake onward,
