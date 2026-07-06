@@ -27,3 +27,4 @@ device		vtnet			# VirtIO Ethernet device
 options 	FDT
 device		acpi
 device		acpi_ged
+device		virtio_console	# VirtIO Console device
