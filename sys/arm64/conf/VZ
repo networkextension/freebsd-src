@@ -1,0 +1,6 @@
+include GENERIC
+ident		VZ
+
+# Apple Virtualization.framework workarounds:
+# virtio-gpu driver hangs at attach on VZ (Blt-only GPU, no linear fb).
+nodevice	virtio_gpu
