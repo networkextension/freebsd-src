@@ -43,6 +43,9 @@
 #include <contrib/dev/acpica/include/acpi.h>
 #include <dev/acpica/acpivar.h>
 
+#include <vm/vm.h>
+#include <vm/pmap.h>
+
 #include "gic_v3_reg.h"
 #include "gic_v3_var.h"
 
@@ -169,6 +172,7 @@ gic_v3_acpi_identify(driver_t *driver, device_t parent)
 	struct madt_table_data madt_data;
 	ACPI_TABLE_MADT *madt;
 	vm_paddr_t physaddr;
+	int gic_version;
 	uintptr_t private;
 	device_t dev;
 
@@ -194,8 +198,35 @@ gic_v3_acpi_identify(driver_t *driver, device_t parent)
 		goto out;
 	}
 
-	/* Check the GIC version is supported by thiss driver */
-	switch(madt_data.dist->Version) {
+	/*
+	 * Check the GIC version is supported by this driver. Some hypervisors
+	 * (e.g. Apple's Virtualization.framework) leave the MADT GIC version
+	 * unspecified (ACPI_MADT_GIC_VERSION_NONE); detect it from the
+	 * distributor's GICD_PIDR2 register in that case, as Linux does.
+	 */
+	gic_version = madt_data.dist->Version;
+	if (gic_version == ACPI_MADT_GIC_VERSION_NONE) {
+		void *dist_va;
+
+		dist_va = pmap_mapdev(madt_data.dist->BaseAddress, GICD_SIZE);
+		if (dist_va != NULL) {
+			uint32_t pidr2;
+
+			pidr2 = *(volatile uint32_t *)
+			    ((uintptr_t)dist_va + GICD_PIDR2);
+			switch (GICR_PIDR2_ARCH(pidr2)) {
+			case GICR_PIDR2_ARCH_GICv3:
+				gic_version = ACPI_MADT_GIC_VERSION_V3;
+				break;
+			case GICR_PIDR2_ARCH_GICv4:
+				gic_version = ACPI_MADT_GIC_VERSION_V4;
+				break;
+			}
+			pmap_unmapdev(dist_va, GICD_SIZE);
+		}
+	}
+
+	switch (gic_version) {
 	case ACPI_MADT_GIC_VERSION_V3:
 	case ACPI_MADT_GIC_VERSION_V4:
 		break;
@@ -229,7 +260,7 @@ gic_v3_acpi_identify(driver_t *driver, device_t parent)
 		    rdist_map, &madt_data);
 	}
 
-	private = madt_data.dist->Version;
+	private = gic_version;
 	/* Flag that the VGIC is in use */
 	if (madt_data.have_vgic)
 		private |= GICV3_PRIV_VGIC;
