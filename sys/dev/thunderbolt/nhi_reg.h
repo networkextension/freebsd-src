@@ -49,6 +49,31 @@
 #define	DEVICE_AR_LP_NHI	0x15bf
 #define DEVICE_ICL_NHI_0	0x8a17
 #define DEVICE_ICL_NHI_1	0x8a0d
+#define	DEVICE_MTL_NHI_0	0x7ec2	/* Meteor Lake-P integrated USB4 NHI0 */
+#define	DEVICE_MTL_NHI_1	0x7ec3	/* Meteor Lake-P integrated USB4 NHI1 */
+#define	DEVICE_TR_NHI		0x15eb	/* Titan Ridge JHL7540 TB3 NHI (discrete) */
+
+/*
+ * Per-controller quirks, keyed on chip family (see the device-matrix note).
+ * Default 0 = the integrated USB4 NHI this driver's BAR0 register map and VSEC
+ * force-power target.
+ */
+#define	NHI_QUIRK_TB3		(1u << 0)  /* TB3/legacy (Alpine/Titan Ridge): different BAR0 register map + force-power window; the USB4 offsets in this header do NOT apply */
+
+/*
+ * Vendor-specific force-power, in PCI *config* space (Ice Lake onward,
+ * including Meteor Lake).  An integrated controller stays powered off until the
+ * host asserts force-power; the firmware (ICM) will not answer ring-0 commands
+ * until it reports ready.  The in-tree driver otherwise relies on the ACPI-WMI
+ * method (nhi_wmi.c); these are the direct VS-cap registers our ICM path uses.
+ */
+#define	NHI_VS_CAP_9			0xc8	/* firmware status */
+#define	 NHI_VS_CAP_9_FW_READY		(1u << 31)
+#define	NHI_VS_CAP_22			0xfc	/* power control */
+#define	 NHI_VS_CAP_22_FORCE_POWER	(1u << 1)
+#define	 NHI_VS_CAP_22_DMA_DELAY_SHIFT	24
+#define	 NHI_VS_CAP_22_DMA_DELAY_MASK	0xff000000u
+#define	 NHI_VS_CAP_22_DMA_DELAY_VAL	0x22
 
 #define VENDOR_AMD		0x1022
 #define DEVICE_PINK_SARDINE_0	0x1668
@@ -100,6 +125,14 @@
 
 #define NHI_RX_RING_TABLE_BASE0		0x29800
 #define RX_TABLE_TX_E2E_HOPID_SHIFT	(1 << 12)
+/*
+ * The paired TX hop id for RX end-to-end flow control lives in bits [22:12] of
+ * the RX table BASE0.  RX_TABLE_TX_E2E_HOPID_SHIFT above is defined as (1<<12),
+ * which is wrong if used as a shift amount (it is a mask/multiplier); use these
+ * corrected values (matches the nhi_icm data path, confirmed on silicon).
+ */
+#define RX_TABLE_E2E_HOPID_SHIFT	12
+#define RX_TABLE_E2E_HOPID_MASK		0x007ff000	/* bits [22:12] */
 #define RX_TABLE_E2E			(1 << 28) /* End-to-end flow control */
 #define RX_TABLE_NS			(1 << 29) /* PCIe No Snoop */
 #define RX_TABLE_RAW			(1 << 30) /* Raw (1)/frame(0) mode */
@@ -179,9 +212,9 @@
 #define	GET_HOST_CAPS_PATHS(val)	((val) & 0x3f)
 
 /*
- * This definition comes from the Linux driver.  In the USB4 spec, this
- * register is named Host Interface Control, and the Interrupt Autoclear bit
- * is at bit17, not bit2.  The Linux driver doesn't seem to acknowledge this.
+ * In the USB4 spec this register is named Host Interface Control, and the
+ * Interrupt Autoclear bit is documented at bit 17; the Intel NHI hardware
+ * implements it at bit 2, which is what is used here.
  */
 #define NHI_DMA_MISC			0x39864
 #define DMA_MISC_INT_AUTOCLEAR		(1 << 2)

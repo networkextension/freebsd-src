@@ -76,6 +76,7 @@ hcm_attach(struct nhi_softc *nsc)
 
 	hcm->dev = nsc->dev;
 	hcm->nsc = nsc;
+	hcm->debug = nsc->debug;
 	nsc->hcm = hcm;
 
 	hcm->taskqueue = taskqueue_create("hcm_event", M_NOWAIT,
@@ -94,9 +95,17 @@ hcm_detach(struct nhi_softc *nsc)
 {
 	struct hcm_softc *hcm;
 
+	/*
+	 * On an ICM-mode controller (or after a failed hcm_attach) the HCM
+	 * was never allocated - detach is still called for the NHI.
+	 */
 	hcm = nsc->hcm;
+	if (hcm == NULL)
+		return (0);
 	if (hcm->taskqueue)
 		taskqueue_free(hcm->taskqueue);
+	nsc->hcm = NULL;
+	free(hcm, M_THUNDERBOLT);
 
 	return (0);
 }
@@ -190,6 +199,34 @@ hcm_cfg_task(void *arg, int pending)
 		if (GET_ADP_CS_TYPE(adp) != ADP_CS2_LANE)
 			continue;
 
+		/*
+		 * Native-CM duties the ICM used to do:
+		 * 1. hot-plugged adapters come up LOCKED (ADP_CS_4.LCK,
+		 *    bit 31 - Linux usb4_port_unlock) and reject all transit
+		 *    with "Adapter locked" error notifications;
+		 * 2. the USB4 port must be marked inter-domain configured
+		 *    (PORT_CS_19.PID, bit 4, at the USB4 port capability,
+		 *    cap id 6 - Linux usb4_port_configure_xdomain) for a
+		 *    host-to-host link.
+		 */
+		error = tb_config_adapter_read(rsc, i, 4, 1, buf);
+		if (error == 0 && (buf[0] & (1u << 31)) != 0) {
+			buf[0] &= ~(1u << 31);
+			error = tb_config_write(rsc, TB_CFG_CS_ADAPTER, i, 4,
+			    1, buf);
+			tb_printf(hcm, "unlocked lane adapter %d (%d)\n", i,
+			    error);
+		}
+		if (tb_config_find_adapter_cap(rsc, i, 6, &offset) == 0 &&
+		    tb_config_adapter_read(rsc, i, offset + 0x13, 1,
+		    buf) == 0 && (buf[0] & (1u << 4)) == 0) {
+			buf[0] |= (1u << 4);
+			error = tb_config_write(rsc, TB_CFG_CS_ADAPTER, i,
+			    offset + 0x13, 1, buf);
+			tb_printf(hcm, "adapter %d: inter-domain (PID) set "
+			    "(%d)\n", i, error);
+		}
+
 		error = tb_config_find_adapter_cap(rsc, i, TB_CFG_CAP_LANE,
 		    &offset);
 		if (error)
@@ -212,10 +249,12 @@ hcm_cfg_task(void *arg, int pending)
 			newr.hi = rsc->route.hi;
 			newr.lo = rsc->route.lo | (i << rsc->depth * 8);
 
-			tb_printf(hcm, "want to add router at 0x%08x%08x\n",
+			tb_debug(hcm, DBG_HCM, "want to add router at 0x%08x%08x\n",
 			    newr.hi, newr.lo);
 			error = tb_router_attach(rsc, newr);
-			tb_printf(rsc, "tb_router_attach returned %d\n", error);
+			if (error != 0)
+				tb_printf(rsc, "tb_router_attach failed: %d\n",
+				    error);
 		}
 	}
 

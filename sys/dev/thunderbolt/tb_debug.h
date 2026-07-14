@@ -33,6 +33,15 @@
 #ifndef _TB_DEBUG_H
 #define _TB_DEBUG_H
 
+/*
+ * __maybe_unused was added to <sys/cdefs.h> in FreeBSD 16.  This module targets
+ * 16 but is kept buildable on 15.x (the driver is generation-agnostic); shim it
+ * here - every thunderbolt source includes this header.  No-op on 16.
+ */
+#ifndef __maybe_unused
+#define	__maybe_unused	__unused
+#endif
+
 typedef struct {
 	uintmax_t	key;
 	const char *	value;

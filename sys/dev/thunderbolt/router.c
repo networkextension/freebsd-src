@@ -56,6 +56,7 @@
 #include <dev/thunderbolt/tb_var.h>
 #include <dev/thunderbolt/tbcfg_reg.h>
 #include <dev/thunderbolt/router_var.h>
+#include <dev/thunderbolt/hcm_var.h>
 #include <dev/thunderbolt/tb_debug.h>
 
 static int router_alloc_cmd(struct router_softc *, struct router_command **);
@@ -71,6 +72,8 @@ static int router_schedule_locked(struct router_softc *,
 static nhi_ring_cb_t router_complete_intr;
 static nhi_ring_cb_t router_response_intr;
 static nhi_ring_cb_t router_notify_intr;
+static nhi_ring_cb_t router_hotplug_intr;
+static nhi_ring_cb_t router_plug_ack_txdone;
 
 #define CFG_DEFAULT_RETRIES	3
 #define CFG_DEFAULT_TIMEOUT	2
@@ -191,10 +194,12 @@ router_register_interrupts(struct router_softc *sc)
 {
 	struct nhi_dispatch tx[] = { { PDF_READ, router_complete_intr, sc },
 				     { PDF_WRITE, router_complete_intr, sc },
+				     { PDF_NOTIFY, router_plug_ack_txdone, sc },
 				     { 0, NULL, NULL } };
 	struct nhi_dispatch rx[] = { { PDF_READ, router_response_intr, sc },
 				     { PDF_WRITE, router_response_intr, sc },
 				     { PDF_NOTIFY, router_notify_intr, sc },
+				     { PDF_HOTPLUG, router_hotplug_intr, sc },
 				     { 0, NULL, NULL } };
 
 	return (nhi_register_pdf(sc->ring0, tx, rx));
@@ -488,12 +493,92 @@ _tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
 	return (0);
 }
 
+/* Mirror of router_prepare_read for a config WRITE request. */
+static void
+router_prepare_write(struct router_softc *sc, struct router_command *cmd,
+    int len)
+{
+	struct nhi_cmd_frame *nhicmd;
+	uint32_t *msg;
+	int msglen, i;
+
+	KASSERT(cmd != NULL, ("cmd cannot be NULL\n"));
+	KASSERT(len % 4 == 0, ("Message must be 32bit padded\n"));
+
+	nhicmd = cmd->nhicmd;
+	msglen = (len - 4) / 4;
+	for (i = 0; i < msglen; i++)
+		nhicmd->data[i] = htobe32(nhicmd->data[i]);
+
+	msg = (uint32_t *)nhicmd->data;
+	msg[msglen] = htobe32(tb_calc_crc(nhicmd->data, len - 4));
+
+	nhicmd->pdf = PDF_WRITE;
+	nhicmd->req_len = len;
+
+	nhicmd->timeout = NHI_CMD_TIMEOUT;
+	nhicmd->retries = 0;
+	nhicmd->resp_buffer = (uint32_t *)cmd->resp_buffer;
+	nhicmd->resp_len = 4 * 4;	/* write resp: route + addr + crc */
+	nhicmd->context = cmd;
+
+	cmd->retries = CFG_DEFAULT_RETRIES;
+	cmd->timeout = CFG_DEFAULT_TIMEOUT;
+}
+
+/*
+ * Synchronous config-space WRITE (upstream left this a stub).  Same
+ * request/response flow as tb_config_read: PDF_WRITE out, the router echoes
+ * a PDF_WRITE response that router_response_intr matches to the inflight
+ * command.  Needed by the native (SW-CM) data path to program hop entries.
+ */
 int
 tb_config_write(struct router_softc *sc, u_int space, u_int adapter,
     u_int offset, u_int dwlen, uint32_t *buf)
 {
+	struct router_command *cmd;
+	struct tb_cfg_write *msg;
+	u_int i;
+	int error, retries;
 
-	return(0);
+	if (dwlen == 0 || dwlen > 60)
+		return (EINVAL);
+
+	if ((error = router_alloc_cmd(sc, &cmd)) != 0)
+		return (error);
+
+	msg = router_get_frame_data(cmd);
+	bzero(msg, sizeof(*msg) + (dwlen + 1) * 4);
+	msg->route.hi = sc->route.hi;
+	msg->route.lo = sc->route.lo;
+	msg->addr_attrs = TB_CONFIG_ADDR(0, space, adapter, dwlen, offset);
+	for (i = 0; i < dwlen; i++)
+		msg->data[i] = buf[i];
+	cmd->callback = router_get_config_cb;
+	cmd->callback_arg = NULL;
+	cmd->dwlen = 0;
+	router_prepare_write(sc, cmd, sizeof(*msg) + (dwlen + 1) * 4);
+
+	retries = cmd->retries;
+	mtx_lock(&sc->mtx);
+	while (retries-- >= 0) {
+		error = router_schedule_locked(sc, cmd);
+		if (error)
+			break;
+
+		error = msleep(cmd, &sc->mtx, 0, "tbtcfgw", cmd->timeout * hz);
+		if (error != EWOULDBLOCK)
+			break;
+		sc->inflight_cmd = NULL;
+		tb_debug(sc, DBG_ROUTER, "Config write timed out, retries=%d\n",
+		    retries);
+	}
+
+	if (cmd->ev != 0)
+		error = EINVAL;
+	router_free_cmd(sc, cmd);
+	mtx_unlock(&sc->mtx);
+	return (error);
 }
 
 static int
@@ -712,6 +797,69 @@ router_response_intr(void *context, union nhi_ring_desc *ring, struct nhi_cmd_fr
 	}
 
 	return;
+}
+
+/*
+ * Hot Plug Event (PDF 5), native-CM mode: the router (re)transmits the event
+ * until the CM acknowledges it with a PDF_NOTIFY packet carrying HP_ACK for
+ * that port (Linux tb_cfg_ack_plug / cfg_error_pkg: error[3:0]=7,
+ * port[13:8], pg[31:30]=2 plug / 3 unplug).  Without the ack the event
+ * floods ring 0 several times a second.  The plug/unplug topology work
+ * itself is a later step; ack + log is the required baseline.
+ */
+static void
+router_hotplug_intr(void *context, union nhi_ring_desc *ring,
+    struct nhi_cmd_frame *nhicmd)
+{
+	struct router_softc *sc = context;
+	struct nhi_cmd_frame *ack;
+	uint32_t route_hi, route_lo, ev, port;
+	uint32_t *msg;
+	bool unplug;
+
+	route_hi = be32toh(nhicmd->data[0]) & ~0x80000000u;
+	route_lo = be32toh(nhicmd->data[1]);
+	ev = be32toh(nhicmd->data[2]);
+	port = ev & 0x3f;
+	unplug = (ev & (1u << 31)) != 0;
+
+	tb_printf(sc, "hotplug event: route 0x%08x%08x port %u %s\n",
+	    route_hi, route_lo, port, unplug ? "unplug" : "plug");
+
+	ack = nhi_alloc_tx_frame(sc->ring0);
+	if (ack == NULL) {
+		tb_debug(sc, DBG_ROUTER, "no tx frame for hotplug ack\n");
+		return;
+	}
+	msg = (uint32_t *)ack->data;
+	msg[0] = htobe32(route_hi);
+	msg[1] = htobe32(route_lo);
+	msg[2] = htobe32(TB_CFG_HP_ACK | (port << 8) |
+	    ((unplug ? 3u : 2u) << 30));
+	msg[3] = htobe32(tb_calc_crc(msg, 12));
+	ack->pdf = PDF_NOTIFY;
+	ack->sof = 0;
+	ack->req_len = 16;
+	if (nhi_tx_schedule(sc->ring0, ack) != 0)
+		nhi_free_tx_frame(sc->ring0, ack);
+
+	/*
+	 * A plug means a newly-LOCKED adapter: re-run the HCM walk (its
+	 * taskqueue context can sleep) so the lane gets unlocked and XDomain
+	 * traffic can flow.  taskqueue_enqueue is interrupt-safe.
+	 */
+	if (!unplug && sc->nsc != NULL && sc->nsc->hcm != NULL)
+		hcm_router_discover(sc->nsc->hcm);
+}
+
+/* TX completion for the fire-and-forget hotplug ack: just free the frame. */
+static void
+router_plug_ack_txdone(void *context, union nhi_ring_desc *ring,
+    struct nhi_cmd_frame *nhicmd)
+{
+	struct router_softc *sc = context;
+
+	nhi_free_tx_frame(sc->ring0, nhicmd);
 }
 
 static void
