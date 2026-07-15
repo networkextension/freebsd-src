@@ -455,13 +455,6 @@ tbnet_reass(struct tbnet_softc *ts, const uint8_t *payload, u_int len,
 	}
 	if (ts->rx_m == NULL || id != ts->rx_id || count != ts->rx_count ||
 	    index != ts->rx_index) {
-		/* XXX #69 diag: which failure mode dominates?  Sampled. */
-		static u_int reass_errs;
-		if ((reass_errs++ & 0xff) == 0)
-			printf("tbt reass err#%u: got id=%u/cnt=%u/idx=%u "
-			    "want id=%u/cnt=%u/idx=%u\n", reass_errs, id,
-			    count, index, ts->rx_id, ts->rx_count,
-			    ts->rx_index);
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		tbnet_reass_reset(ts);
 		return (NULL);
@@ -557,11 +550,6 @@ tbnet_rx_cb(void *context, union nhi_ring_desc *rdesc,
 	id = le16dec(frame + TBNET_OFF_ID);
 	count = le32dec(frame + TBNET_OFF_COUNT);
 	if (!tbnet_frame_ok(len, fsize, count)) {
-		/* XXX #69 diag: torn/garbage header?  Sampled. */
-		static u_int hdr_errs;
-		if ((hdr_errs++ & 0xff) == 0)
-			printf("tbt hdr err#%u: len=%u fsize=%u idx=%u id=%u "
-			    "cnt=%u\n", hdr_errs, len, fsize, index, id, count);
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		return;
 	}

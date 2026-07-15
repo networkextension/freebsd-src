@@ -371,6 +371,25 @@ router_get_config_cb(struct router_softc *sc, struct router_command *cmd,
 	mtx_unlock(&sc->mtx);
 }
 
+/*
+ * Free a timed-out command whose descriptors may still be live in the ring:
+ * orphan the nhi frame (context NULL) instead of recycling it, and let the
+ * late TX/RX completion return it (router_complete_intr).  Recycling it here
+ * let a new command reuse the frame while the old descriptor still referenced
+ * it - the completion then chased a freed router_command (GPF at
+ * 0xdeadc0dedeadc0de in router_complete_intr, seen live).
+ */
+static void
+router_abandon_cmd(struct router_softc *sc, struct router_command *cmd)
+{
+	if (cmd->nhicmd != NULL) {
+		cmd->nhicmd->context = NULL;
+		cmd->nhicmd->resp_buffer = NULL;
+		cmd->nhicmd = NULL;
+	}
+	router_free_cmd(sc, cmd);
+}
+
 int
 tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
     u_int offset, u_int dwlen, uint32_t *buf)
@@ -412,6 +431,7 @@ tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
 		}
 		if (nhi_dead(sc->nsc)) {
 			tb_printf(sc, "NHI missing - failing config command\n");
+			sc->inflight_cmd = NULL;
 			error = ENXIO;
 			break;
 		}
@@ -421,7 +441,10 @@ tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
 
 	if (cmd->ev != 0)
 		error = EINVAL;
-	router_free_cmd(sc, cmd);
+	if (error == EWOULDBLOCK || error == ETIMEDOUT || error == ENXIO)
+		router_abandon_cmd(sc, cmd);	/* descriptors may be live */
+	else
+		router_free_cmd(sc, cmd);
 	mtx_unlock(&sc->mtx);
 	return (error);
 }
@@ -472,7 +495,7 @@ tb_config_read_polled(struct router_softc *sc, u_int space, u_int adapter,
 		if ((cmd->flags & RCMD_POLL_COMPLETE) == 0) {
 			error = ETIMEDOUT;
 			sc->inflight_cmd = NULL;
-			tb_printf(sc, "cfgpoll timeout: tx_pici=0x%08x "
+			tb_debug(sc, DBG_ROUTER, "cfgpoll timeout: tx_pici=0x%08x "
 			    "rx_pici=0x%08x tx_tbl=0x%08x\n",
 			    nhi_read_reg(sc->nsc, sc->ring0->tx_pici_reg),
 			    nhi_read_reg(sc->nsc, sc->ring0->rx_pici_reg),
@@ -484,7 +507,10 @@ tb_config_read_polled(struct router_softc *sc, u_int space, u_int adapter,
 
 	if (cmd->ev != 0)
 		error = EINVAL;
-	router_free_cmd(sc, cmd);
+	if (error == EWOULDBLOCK || error == ETIMEDOUT || error == ENXIO)
+		router_abandon_cmd(sc, cmd);	/* descriptors may be live */
+	else
+		router_free_cmd(sc, cmd);
 	mtx_unlock(&sc->mtx);
 	return (error);
 }
@@ -623,6 +649,7 @@ tb_config_write(struct router_softc *sc, u_int space, u_int adapter,
 		}
 		if (nhi_dead(sc->nsc)) {
 			tb_printf(sc, "NHI missing - failing config command\n");
+			sc->inflight_cmd = NULL;
 			error = ENXIO;
 			break;
 		}
@@ -633,7 +660,10 @@ tb_config_write(struct router_softc *sc, u_int space, u_int adapter,
 
 	if (cmd->ev != 0)
 		error = EINVAL;
-	router_free_cmd(sc, cmd);
+	if (error == EWOULDBLOCK || error == ETIMEDOUT || error == ENXIO)
+		router_abandon_cmd(sc, cmd);	/* descriptors may be live */
+	else
+		router_free_cmd(sc, cmd);
 	mtx_unlock(&sc->mtx);
 	return (error);
 }
@@ -777,6 +807,13 @@ router_complete_intr(void *context, union nhi_ring_desc *ring,
 	KASSERT(nhicmd != NULL, ("nhicmd cannot be NULL\n"));
 
 	cmd = (struct router_command *)(nhicmd->context);
+	if (cmd == NULL) {
+		/* Late completion of an abandoned (timed-out) command: the
+		 * router_command is gone; just return the orphaned frame. */
+		sc = (struct router_softc *)context;
+		nhi_free_tx_frame(sc->ring0, nhicmd);
+		return;
+	}
 	sc = cmd->sc;
 	tb_debug(sc, DBG_ROUTER|DBG_EXTRA, "router_complete_intr called\n");
 

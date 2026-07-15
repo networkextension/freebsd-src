@@ -520,10 +520,10 @@ tb_icm_bringup(void *arg, int pending __unused)
 	struct tb_icm *icm = arg;
 
 	if (icm->dying || icm->paths_approved || !icm->has_peer) {
-		/* XXX #69 diag */
-		device_printf(icm->nsc->dev, "bring-up skipped: dying=%d "
-		    "approved=%d has_peer=%d\n", icm->dying,
-		    icm->paths_approved, icm->has_peer);
+		if (bootverbose)
+			device_printf(icm->nsc->dev, "bring-up skipped: "
+			    "dying=%d approved=%d has_peer=%d\n", icm->dying,
+			    icm->paths_approved, icm->has_peer);
 		return;
 	}
 	if (icm->native) {
@@ -766,6 +766,9 @@ tb_icm_login_timer(void *arg)
 	if (icm->has_peer && !icm->paths_approved && !icm->login_sent &&
 	    icm->login_tries < 60) {
 		icm->login_tries++;
+		/* Re-nudge the peer's directory read while it stays silent. */
+		if ((icm->login_tries % 5) == 1)
+			tb_xdomain_notify_changed(icm->xd);
 		tbip_send_login(icm);
 	}
 	if (icm->has_peer && !icm->paths_approved)
@@ -806,6 +809,14 @@ tb_icm_event_cb(void *context, union nhi_ring_desc *rdesc,
 		tb_xdomain_set_peer(icm->xd, icm->peer_uuid, icm->local_uuid,
 		    icm->peer_route_hi, icm->peer_route_lo);
 		tbip_send_logout(icm);		/* reset a stale peer session */
+		/*
+		 * Nudge the peer to (re)read our property directory - the
+		 * standalone driver did this on every XDOMAIN_CONNECTED
+		 * (nhi_xdomain_notify_changed); without it macOS never
+		 * learns about our network service in ICM mode and ignores
+		 * our LOGINs (#76).
+		 */
+		tb_xdomain_notify_changed(icm->xd);
 		if (!icm->dying)
 			callout_reset(&icm->login_co, hz / 2,
 			    tb_icm_login_timer, icm);
