@@ -19,8 +19,8 @@ struct hcm_softc {
 
 	struct task		cfg_task;
 	struct task		link_task;	/* serialized plug/unplug */
-	volatile int		plug_pending;	/* coalesced event flags */
-	volatile int		unplug_pending;
+	volatile u_int		plug_pending;	/* coalesced event flags */
+	volatile u_int		unplug_pending;
 	struct taskqueue	*taskqueue;
 };
 

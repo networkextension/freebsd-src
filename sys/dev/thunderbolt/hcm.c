@@ -47,6 +47,7 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
+#include <machine/atomic.h>
 #include <machine/bus.h>
 #include <machine/stdarg.h>
 
@@ -106,9 +107,9 @@ hcm_link_event(struct hcm_softc *hcm, u_int port, bool unplug)
 	if (hcm == NULL)
 		return;
 	if (unplug)
-		hcm->unplug_pending = 1;
+		atomic_store_rel_int(&hcm->unplug_pending, 1);
 	else
-		hcm->plug_pending = 1;
+		atomic_store_rel_int(&hcm->plug_pending, 1);
 	taskqueue_enqueue(hcm->taskqueue, &hcm->link_task);
 }
 
@@ -119,10 +120,10 @@ hcm_link_task(void *arg, int pending __unused)
 	struct nhi_softc *nsc = hcm->nsc;
 	int plug, unplug;
 
-	unplug = hcm->unplug_pending;
-	hcm->unplug_pending = 0;
-	plug = hcm->plug_pending;
-	hcm->plug_pending = 0;
+	/* Atomic take: a plain read+clear loses an event that lands in the
+	 * window between them (interrupt on another CPU). */
+	unplug = atomic_readandclear_int(&hcm->unplug_pending);
+	plug = atomic_readandclear_int(&hcm->plug_pending);
 
 	if (nhi_dead(nsc)) {
 		/* Controller vanished (e.g. TB->USB mode renegotiation):

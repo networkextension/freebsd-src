@@ -41,6 +41,7 @@
 #include <net/if_types.h>
 #include <net/ethernet.h>
 #include <net/vnet.h>
+#include <net/bpf.h>
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
 #include <netinet/ip.h>
@@ -65,6 +66,7 @@
 #define	 TBNET_OFF_ID		6	/* __le16 frame id (per network packet) */
 #define	 TBNET_OFF_COUNT	8	/* __le32 frame count (frames in packet) */
 #define	TBNET_MAX_PAYLOAD	(TBNET_FRAME_SIZE - TBNET_HDR_LEN)
+#define	TBNET_MAX_FRAGS		17	/* howmany(64K, TBNET_MAX_PAYLOAD) */
 #define	TBNET_PDF_FRAME_START	1	/* descriptor SOF for a data frame */
 #define	TBNET_PDF_FRAME_END	2	/* descriptor EOF for a data frame */
 
@@ -85,6 +87,7 @@ struct tbnet_softc {
 	uint16_t		rx_id;
 	u_int			rx_count;
 	u_int			rx_index;
+	int			rx_stamp;	/* ticks at last progress */
 
 	/* LRO: coalesce TCP segments in the RX poll, flush once per batch
 	 * (the FreeBSD equivalent of Linux's napi_gro_receive). */
@@ -132,6 +135,8 @@ tbnet_create(struct nhi_softc *nsc, const uint8_t *mac, struct tbnet_softc **tsp
 	mtx_init(&ts->lock, "tbnet", NULL, MTX_DEF);
 
 	ifp = if_alloc(IFT_ETHER);
+	if (ifp == NULL)
+		return (ENOMEM);
 	ts->ifp = ifp;
 	if_setsoftc(ifp, ts);
 	if_initname(ifp, "tbt", device_get_unit(nsc->dev));
@@ -308,7 +313,7 @@ static int
 tbnet_transmit(if_t ifp, struct mbuf *m)
 {
 	struct tbnet_softc *ts = if_getsoftc(ifp);
-	struct nhi_cmd_frame *cmd;
+	struct nhi_cmd_frame *cmd, *cmds[TBNET_MAX_FRAGS];
 	uint8_t *frame;
 	u_int pktlen, off, index, count, chunk;
 	uint16_t id;
@@ -324,17 +329,36 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 		return (0);
 	}
 	count = howmany(pktlen, TBNET_MAX_PAYLOAD);
+	if (count > TBNET_MAX_FRAGS) {
+		if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+		m_freem(m);
+		return (EMSGSIZE);
+	}
+
+	ETHER_BPF_MTAP(ifp, m);
 
 	mtx_lock(&ts->lock);
+	/*
+	 * All-or-nothing: reserve every frame up front.  Scheduling a prefix
+	 * and then running out mid-packet strands the peer's reassembly on
+	 * the missing tail fragments (review P1).
+	 */
+	for (index = 0; index < count; index++) {
+		cmds[index] = nhi_alloc_tx_frame(ts->txring);
+		if (cmds[index] == NULL) {
+			while (index > 0)
+				nhi_free_tx_frame(ts->txring, cmds[--index]);
+			mtx_unlock(&ts->lock);
+			if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+			m_freem(m);
+			return (ENOBUFS);
+		}
+	}
 	id = ts->tx_frame_id++;
 	for (index = 0, off = 0; index < count; index++, off += chunk) {
 		chunk = MIN(pktlen - off, TBNET_MAX_PAYLOAD);
 
-		cmd = nhi_alloc_tx_frame(ts->txring);
-		if (cmd == NULL) {		/* TX ring full */
-			error = ENOBUFS;
-			break;
-		}
+		cmd = cmds[index];
 		frame = (uint8_t *)cmd->data;
 		le32enc(frame + TBNET_OFF_SIZE, chunk);
 		le16enc(frame + TBNET_OFF_INDEX, index);
@@ -347,7 +371,10 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 		cmd->pdf = TBNET_PDF_FRAME_END;		/* descriptor EOF */
 		error = nhi_tx_schedule(ts->txring, cmd);
 		if (error != 0) {
-			nhi_free_tx_frame(ts->txring, cmd);
+			/* Free this and every not-yet-scheduled fragment;
+			 * the already-scheduled prefix cannot be recalled. */
+			for (; index < count; index++)
+				nhi_free_tx_frame(ts->txring, cmds[index]);
 			break;
 		}
 	}
@@ -407,6 +434,15 @@ tbnet_ioctl(if_t ifp, u_long cmd, caddr_t data)
 	case SIOCDELMULTI:
 		/* No hardware multicast filter; all frames are delivered. */
 		return (0);
+	case SIOCSIFCAP: {
+		struct tbnet_softc *ts = if_getsoftc(ifp);
+		int mask = ifr->ifr_reqcap ^ if_getcapenable(ifp);
+
+		/* LRO is the only toggleable capability. */
+		if ((mask & IFCAP_LRO) != 0 && ts->lro_ok)
+			if_togglecapenable(ifp, IFCAP_LRO);
+		return (0);
+	}
 	default:
 		return (ether_ioctl(ifp, cmd, data));
 	}
@@ -414,13 +450,15 @@ tbnet_ioctl(if_t ifp, u_long cmd, caddr_t data)
 
 /* Validate a received frame header. */
 static bool
-tbnet_frame_ok(u_int len, u_int fsize, u_int count)
+tbnet_frame_ok(u_int len, u_int fsize, u_int count, u_int index)
 {
 	if (len < TBNET_HDR_LEN)
 		return (false);
 	if (fsize == 0 || fsize > len - TBNET_HDR_LEN)
 		return (false);
-	if (count == 0 || count > TBNET_RING_DEPTH)
+	if (count == 0 || count > TBNET_MAX_FRAGS)
+		return (false);
+	if (index >= count)
 		return (false);
 	return (true);
 }
@@ -465,6 +503,7 @@ tbnet_reass(struct tbnet_softc *ts, const uint8_t *payload, u_int len,
 		return (NULL);
 	}
 	ts->rx_index++;
+	ts->rx_stamp = ticks;
 	if (ts->rx_index == ts->rx_count) {
 		m = ts->rx_m;
 		ts->rx_m = NULL;
@@ -486,7 +525,8 @@ tbnet_rx_deliver(struct tbnet_softc *ts, struct mbuf *m)
 	struct epoch_tracker et;
 
 	NET_EPOCH_ENTER(et);
-	if (!ts->lro_ok || tcp_lro_rx(&ts->lro, m, 0) != 0)
+	if (!ts->lro_ok || (if_getcapenable(ts->ifp) & IFCAP_LRO) == 0 ||
+	    tcp_lro_rx(&ts->lro, m, 0) != 0)
 		if_input(ts->ifp, m);
 	NET_EPOCH_EXIT(et);
 }
@@ -549,9 +589,16 @@ tbnet_rx_cb(void *context, union nhi_ring_desc *rdesc,
 	index = le16dec(frame + TBNET_OFF_INDEX);
 	id = le16dec(frame + TBNET_OFF_ID);
 	count = le32dec(frame + TBNET_OFF_COUNT);
-	if (!tbnet_frame_ok(len, fsize, count)) {
+	if (!tbnet_frame_ok(len, fsize, count, index)) {
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		return;
+	}
+
+	/* A reassembly the peer abandoned (link flap mid-packet) would hold
+	 * rx_m forever if only single-frame packets follow: age it out. */
+	if (ts->rx_m != NULL && (u_int)(ticks - ts->rx_stamp) > (u_int)hz) {
+		if_inc_counter(ifp, IFCOUNTER_IQDROPS, 1);
+		tbnet_reass_reset(ts);
 	}
 	payload = frame + TBNET_HDR_LEN;
 
