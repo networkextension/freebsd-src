@@ -404,7 +404,17 @@ nhi_attach(struct nhi_softc *sc)
 	tb_printf(sc, "icm=%s (fw_status=0x%08x)\n",
 	    nhi_is_icm(sc) ? "present" : "absent",
 	    nhi_read_reg(sc, TBT_FW_STATUS));
-	if (nhi_is_icm(sc))
+	/*
+	 * Force-power is a USB4-only path (VS_CAP_22 bit in PCI config).  TB3
+	 * (Titan/Alpine Ridge) powers differently: Mac evaluates ACPI TRPE and
+	 * the SMC already leaves the controller D0 + bus-master at OS boot (RE:
+	 * NHIType3::enablePower is a no-op, prePCIWake runs ACPI TRPE).  So
+	 * never run the USB4 force-power on TB3 - the controller is already
+	 * powered, and writing VS_CAP on TB3 would poke the wrong register.
+	 * (On Mac TB3 nhi_is_icm is false anyway - ICM_EN=0 - so it takes the
+	 * native/SW-CM path below.)
+	 */
+	if (nhi_is_icm(sc) && (sc->quirks & NHI_QUIRK_TB3) == 0)
 		(void)nhi_force_power(sc);
 
 	/*

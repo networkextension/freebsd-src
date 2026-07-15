@@ -326,6 +326,14 @@ nhi_write_reg(struct nhi_softc *sc, u_int offset, uint32_t val)
 {
 	bus_space_write_4(sc->regs_btag, sc->regs_bhandle, offset,
 	    htole32(val));
+	/*
+	 * TB3 (Titan/Alpine Ridge, NHI_QUIRK_TB3 = 1u<<0) needs a posting
+	 * read-back to flush each write: Apple's IntelPCIHAL reads HOST_CAPS
+	 * (0x39640) after every register write, else back-to-back ring-setup
+	 * writes can be lost (RE of AppleThunderboltIntelPCIHAL).
+	 */
+	if ((sc->quirks & (1u << 0)) != 0)
+		(void)bus_space_read_4(sc->regs_btag, sc->regs_bhandle, 0x39640);
 }
 
 static __inline struct nhi_cmd_frame *

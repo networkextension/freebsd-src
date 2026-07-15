@@ -157,17 +157,29 @@ nhi_pci_attach(device_t dev)
 
 	/*
 	 * Classify BEFORE touching the hardware.  A TB3/legacy NHI (Titan/Alpine
-	 * Ridge) has a different register map + force-power path than the USB4 NHI
-	 * this driver drives, and on a Mac the SMC/firmware co-manages the
-	 * controller - mapping its BAR or grabbing its MSI-X below would wedge the
-	 * machine.  The probe already set the desc so it is recognised; decline
-	 * here, before any resource allocation, until TB3 support exists.
+	 * Ridge) differs from the USB4 NHI only in POWER (Mac uses ACPI TRPE +
+	 * SMC pre-power, no VS_CAP force-power) and two write quirks (posting
+	 * read-back, a 20ms-settle 0x39858 reg); the ring/interrupt/caps
+	 * register map is byte-for-byte identical to USB4 (RE of
+	 * AppleThunderboltNHIType3/IntelPCIHAL, Sonoma 14.1).  Attaching maps
+	 * BAR0 + grabs MSI-X; on a Mac the SMC already co-manages the controller,
+	 * so this is gated behind hw.nhi.tb3 (default off) and stays declined
+	 * until explicitly enabled for bring-up.
 	 */
 	sc->quirks = nhi_device_quirks(pci_get_device(dev));
 	if ((sc->quirks & NHI_QUIRK_TB3) != 0) {
-		device_printf(dev, "TB3/legacy NHI (dev 0x%04x): not yet supported; "
-		    "declining before touching the controller\n", pci_get_device(dev));
-		return (ENXIO);
+		int tb3 = 0;
+
+		TUNABLE_INT_FETCH("hw.nhi.tb3", &tb3);
+		if (tb3 == 0) {
+			device_printf(dev, "TB3/legacy NHI (dev 0x%04x): experimental "
+			    "- set hw.nhi.tb3=1 to attach (declining for now)\n",
+			    pci_get_device(dev));
+			return (ENXIO);
+		}
+		device_printf(dev, "TB3/legacy NHI (dev 0x%04x): attaching "
+		    "(hw.nhi.tb3=1); force-power skipped (SMC/ACPI pre-powers)\n",
+		    pci_get_device(dev));
 	}
 
 	tb_debug(sc, DBG_INIT|DBG_FULL, "busmaster status was %s\n",
