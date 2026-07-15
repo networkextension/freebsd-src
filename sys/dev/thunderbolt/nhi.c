@@ -414,11 +414,12 @@ nhi_detach(struct nhi_softc *sc)
 	 * the HCM used to dereference the NULL sc->hcm (kldunload panic,
 	 * hcm_detach+0x4).
 	 */
+	/* hcm first: its taskqueue's link task dereferences sc->icm. */
+	hcm_detach(sc);
 	if (sc->icm != NULL) {
 		tb_icm_fini(sc->icm);
 		sc->icm = NULL;
 	}
-	hcm_detach(sc);
 	if (sc->root_rsc != NULL) {
 		tb_router_detach(sc->root_rsc);
 		sc->root_rsc = NULL;
@@ -600,6 +601,18 @@ nhi_configure_ring(struct nhi_softc *sc, struct nhi_ring_pair *ring)
 
 	idx = ring->ring_num * 16;
 
+	/*
+	 * Reset both halves of the TX/RX index registers while the ring is
+	 * inactive - this is the one place a full 32-bit write is correct.
+	 * A re-attach (kldunload/kldload, tb-bridge reload) inherits the
+	 * previous instance's PI/CI here; the running-state doorbells only
+	 * touch their own 16-bit half (#69), so stale values would otherwise
+	 * persist and the engine never transmits (root-router config reads
+	 * time out with err 60 on the second attach of a boot).
+	 */
+	nhi_write_reg(sc, ring->tx_pici_reg, 0);
+	nhi_write_reg(sc, ring->rx_pici_reg, 0);
+
 	/* Program the TX ring address and size */
 	busaddr = ring->tx_ring_busaddr;
 	nhi_write_reg(sc, NHI_TX_RING_ADDR_LO + idx, busaddr & 0xffffffff);
@@ -670,6 +683,16 @@ nhi_activate_ring(struct nhi_ring_pair *ring)
 		    TX_TABLE_RAW | TX_TABLE_VALID);
 		nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE0 + idx,
 		    RX_TABLE_RAW | RX_TABLE_VALID);
+		/*
+		 * Zero both PI/CI halves now that the ring is VALID - index
+		 * writes are ignored on an invalid ring, and a re-attach
+		 * (prior instance detached, or its attach failed) inherits
+		 * stale indices that stall the TX engine forever (config
+		 * reads err 60).  Safe here: enabled but idle, nothing
+		 * posted yet.
+		 */
+		nhi_write_reg(sc, ring->tx_pici_reg, 0);
+		nhi_write_reg(sc, ring->rx_pici_reg, 0);
 		return (0);
 	}
 
@@ -695,6 +718,9 @@ nhi_activate_ring(struct nhi_ring_pair *ring)
 		nhi_write_reg(sc, NHI_TX_RING_TABLE_BASE0 + idx, txflags);
 		nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE0 + idx, rxflags);
 	}
+	/* See the RAW branch: reset stale indices once VALID, before use. */
+	nhi_write_reg(sc, ring->tx_pici_reg, 0);
+	nhi_write_reg(sc, ring->rx_pici_reg, 0);
 
 	return (0);
 }
@@ -715,6 +741,16 @@ nhi_deactivate_ring(struct nhi_ring_pair *r)
 	tb_debug(sc, DBG_INIT, "Setting ring %d sizes to 0\n", r->ring_num);
 	nhi_write_reg(sc, NHI_TX_RING_SIZE + idx, 0);
 	nhi_write_reg(sc, NHI_RX_RING_SIZE + idx, 0);
+
+	/*
+	 * Zero both index registers on the way down, like Linux tb_ring_stop.
+	 * Index writes are ignored while a ring is torn down/invalid, so this
+	 * is the only reliable point - stale PI/CI here made every re-attach
+	 * time out its config reads (TX engine saw PI=1 vs old CI=N and never
+	 * transmitted).
+	 */
+	nhi_write_reg(sc, r->tx_pici_reg, 0);
+	nhi_write_reg(sc, r->rx_pici_reg, 0);
 
 	return (0);
 }
@@ -1199,6 +1235,14 @@ nhi_tx_enqueue(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 	    "busaddr= 0x%jx\n", r->tx_pi, cmd->idx, cmd->req_len,
 	    cmd->data_busaddr);
 
+	/*
+	 * Doorbell must be a full 32-bit write: this NHI IGNORES sub-dword
+	 * MMIO (a 16-bit PI-only write was proven to never land - tx_pici
+	 * stayed 0 and the engine never transmitted).  The CI half is
+	 * hardware's field; writing our (possibly lagged) software tx_ci
+	 * into it has run every campaign to date without harm, so the
+	 * engine evidently latches only the PI half on writes.
+	 */
 	nhi_write_reg(sc, r->tx_pici_reg, pi << TX_RING_PI_SHIFT | r->tx_ci);
 	mtx_unlock(&r->mtx);
 	return (0);
@@ -1215,7 +1259,8 @@ nhi_tx_schedule(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 
 	error = nhi_tx_enqueue(r, cmd);
 	if (error == EBUSY)
-		nhi_write_reg(r->sc, r->tx_pici_reg, r->tx_pi << TX_RING_PI_SHIFT | r->tx_ci);
+		nhi_write_reg(r->sc, r->tx_pici_reg,
+		    r->tx_pi << TX_RING_PI_SHIFT | r->tx_ci);
 	return (error);
 }
 
@@ -1576,6 +1621,11 @@ nhi_ring_process(struct nhi_ring_pair *r)
 		 * producer to the tail and starve RX credits.  Ring 0 keeps the
 		 * combined PI|CI write it was validated with.
 		 */
+		/*
+		 * 32-bit only - this NHI ignores sub-dword MMIO writes (see
+		 * the TX doorbell).  Field ownership asymmetry is tolerated
+		 * by hardware: it latches only the half it doesn't own.
+		 */
 		if (r->frame_mode)
 			val = r->rx_ci & RX_RING_CI_MASK;
 		else
@@ -1609,6 +1659,11 @@ nhi_rxpoll_timer(void *arg)
 
 	if (!r->rxpoll_active)
 		return;
+	if (nhi_dead(r->sc)) {
+		/* Controller vanished (mode switch/unplug): stop polling. */
+		r->rxpoll_active = false;
+		return;
+	}
 	nhi_ring_process(r);
 	callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
 	    nhi_rxpoll_timer, r, C_PREL(2));

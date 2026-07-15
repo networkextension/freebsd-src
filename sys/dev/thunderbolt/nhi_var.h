@@ -301,6 +301,27 @@ nhi_read_reg(struct nhi_softc *sc, u_int offset)
 }
 
 static __inline void
+nhi_write_reg_2(struct nhi_softc *sc, u_int offset, uint16_t val)
+{
+	bus_space_write_2(sc->regs_btag, sc->regs_bhandle, offset, val);
+}
+
+/*
+ * "NHI missing" sentinel (Apple guards every register access with
+ * read(0x39640)==0xFFFFFFFF): all-ones from an always-valid register means
+ * the PCI function vanished - e.g. the port renegotiated from Thunderbolt to
+ * USB mode mid-session.  Callers should fail fast and tear down instead of
+ * timing out command-by-command.
+ */
+static __inline bool
+nhi_dead(struct nhi_softc *sc)
+{
+	/* 0x39944 = TBT_FW_STATUS (nhi_reg.h; not all users include it). */
+	return (bus_space_read_4(sc->regs_btag, sc->regs_bhandle,
+	    0x39944) == 0xffffffff);
+}
+
+static __inline void
 nhi_write_reg(struct nhi_softc *sc, u_int offset, uint32_t val)
 {
 	bus_space_write_4(sc->regs_btag, sc->regs_bhandle, offset,

@@ -358,6 +358,62 @@ tb_icm_program_paths(struct tb_icm *icm)
 	return (0);
 }
 
+/* Invalidate the session's hop entries (Valid=0) - the inverse of
+ * tb_icm_program_paths; Apple deactivates the hop out of the table before
+ * tunnel deallocation.  Sleepable context. */
+static void
+tb_icm_invalidate_paths(struct tb_icm *icm)
+{
+	struct router_softc *rsc = icm->nsc->root_rsc;
+	uint32_t buf[2] = { 0, 0 };
+	u_int lane;
+
+	if (rsc == NULL || nhi_dead(icm->nsc))
+		return;
+	lane = icm->peer_route_lo & 0x3f;
+	if (lane == 0)
+		lane = 1;
+	(void)tb_config_write(rsc, TB_CFG_CS_PATH, lane,
+	    icm->remote_tx_hopid * 2, 2, buf);
+	buf[0] = buf[1] = 0;
+	(void)tb_config_write(rsc, TB_CFG_CS_PATH, TB_SWCM_NHI_PORT,
+	    ICM_DATA_TX_RING * 2, 2, buf);
+}
+
+/*
+ * Ordered link-down teardown (unplug / controller loss), Apple-style:
+ * carrier down + ring teardown (async on our taskqueue), hop entries
+ * invalidated, session state reset so a future plug re-bootstraps cleanly.
+ * Called from the HCM link-event task (sleepable).
+ */
+void
+tb_icm_link_down(struct tb_icm *icm)
+{
+	bool had_paths;
+
+	if (icm == NULL || icm->dying)
+		return;
+	callout_stop(&icm->login_co);
+	had_paths = icm->paths_approved;
+	taskqueue_enqueue(icm->tq, &icm->teardown_task);
+	if (had_paths)
+		tb_icm_invalidate_paths(icm);
+	icm->has_peer = false;
+	icm->login_sent = icm->login_received = false;
+	icm->login_tries = icm->logout_kicks = 0;
+	device_printf(icm->nsc->dev, "link down: session torn down\n");
+}
+
+/* A plug happened: restart the discovery nudge loop so the peer re-initiates. */
+void
+tb_icm_link_up_hint(struct tb_icm *icm)
+{
+	if (icm == NULL || icm->dying)
+		return;
+	icm->xdkick_tries = 0;
+	callout_reset(&icm->login_co, hz, tb_icm_login_timer, icm);
+}
+
 /* Peer session bootstrapped by the XDomain responder (native mode: no
  * XDOMAIN_CONNECTED event will ever come from firmware).  Interrupt context. */
 static void

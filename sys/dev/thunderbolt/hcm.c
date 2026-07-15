@@ -59,7 +59,10 @@
 #include <dev/thunderbolt/router_var.h>
 #include <dev/thunderbolt/hcm_var.h>
 
+#include <dev/thunderbolt/tb_icm.h>
+
 static void hcm_cfg_task(void *, int);
+static void hcm_link_task(void *, int);
 
 int
 hcm_attach(struct nhi_softc *nsc)
@@ -86,8 +89,59 @@ hcm_attach(struct nhi_softc *nsc)
 	taskqueue_start_threads(&hcm->taskqueue, 1, PI_DISK, "tbhcm%d_tq",
 	    device_get_unit(nsc->dev));
 	TASK_INIT(&hcm->cfg_task, 0, hcm_cfg_task, hcm);
+	TASK_INIT(&hcm->link_task, 0, hcm_link_task, hcm);
 
 	return (0);
+}
+
+/*
+ * Serialized link-event entry point.  Hot plug/unplug interrupts (and any
+ * future link events) funnel through here onto the single HCM taskqueue -
+ * Apple's "one configuration thread" model.  Interrupt-safe; events coalesce
+ * via the pending flags (a dual-lane plug raises two interrupts).
+ */
+void
+hcm_link_event(struct hcm_softc *hcm, u_int port, bool unplug)
+{
+	if (hcm == NULL)
+		return;
+	if (unplug)
+		hcm->unplug_pending = 1;
+	else
+		hcm->plug_pending = 1;
+	taskqueue_enqueue(hcm->taskqueue, &hcm->link_task);
+}
+
+static void
+hcm_link_task(void *arg, int pending __unused)
+{
+	struct hcm_softc *hcm = arg;
+	struct nhi_softc *nsc = hcm->nsc;
+	int plug, unplug;
+
+	unplug = hcm->unplug_pending;
+	hcm->unplug_pending = 0;
+	plug = hcm->plug_pending;
+	hcm->plug_pending = 0;
+
+	if (nhi_dead(nsc)) {
+		/* Controller vanished (e.g. TB->USB mode renegotiation):
+		 * tear the session down cleanly and stop touching hardware. */
+		tb_printf(hcm, "NHI missing - tearing down session\n");
+		tb_icm_link_down(nsc->icm);
+		return;
+	}
+
+	if (unplug)
+		tb_icm_link_down(nsc->icm);
+
+	if (plug) {
+		/* Debounce: a plug raises per-lane events back to back; let
+		 * the link settle, then unlock/configure and nudge the peer. */
+		pause("tbdeb", hz / 2);
+		hcm_cfg_task(hcm, 0);
+		tb_icm_link_up_hint(nsc->icm);
+	}
 }
 
 int

@@ -392,6 +392,29 @@ tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
 		error = msleep(cmd, &sc->mtx, 0, "tbtcfg", cmd->timeout * hz);
 		if (error != EWOULDBLOCK)
 			break;
+		/*
+		 * Timeout.  The ring0 interrupt may be dead (a re-attach after
+		 * kldunload loses vector delivery) - drain the ring by hand,
+		 * like Apple's integrated HAL services rings by poll timer.
+		 * If that completes the command, permanently switch ring0 to
+		 * polling and carry on: degraded, not broken.
+		 */
+		mtx_unlock(&sc->mtx);
+		nhi_ring_poll(sc->ring0);
+		mtx_lock(&sc->mtx);
+		if (sc->inflight_cmd != cmd) {
+			if (!sc->ring0->rxpoll_active)
+				tb_printf(sc, "ring0 interrupt not firing - "
+				    "switching ring0 to polling\n");
+			nhi_ring_force_poll(sc->ring0);
+			error = 0;
+			break;
+		}
+		if (nhi_dead(sc->nsc)) {
+			tb_printf(sc, "NHI missing - failing config command\n");
+			error = ENXIO;
+			break;
+		}
 		sc->inflight_cmd = NULL;
 		tb_debug(sc, DBG_ROUTER, "Config command timed out, retries=%d\n", retries);
 	}
@@ -429,6 +452,19 @@ tb_config_read_polled(struct router_softc *sc, u_int space, u_int adapter,
 			DELAY(100 * 1000);
 			if ((cmd->flags & RCMD_POLL_COMPLETE) != 0)
 				break;
+			/*
+			 * "Polled" here only spins on a flag the interrupt
+			 * path sets - with a dead ring0 vector (re-attach
+			 * after kldunload) it never completes.  After half
+			 * the timeout with no completion the ISR is
+			 * demonstrably not servicing the ring: drain it by
+			 * hand.  (Never poll while the ISR may be live -
+			 * concurrent nhi_ring_process on one ring corrupts
+			 * the RX single-consumer state; that deadlocked a
+			 * whole attach once.)
+			 */
+			if (timeout <= (cmd->timeout * 1000000) / 2)
+				nhi_ring_poll(sc->ring0);
 			timeout -= 100000;
 		}
 
@@ -436,7 +472,11 @@ tb_config_read_polled(struct router_softc *sc, u_int space, u_int adapter,
 		if ((cmd->flags & RCMD_POLL_COMPLETE) == 0) {
 			error = ETIMEDOUT;
 			sc->inflight_cmd = NULL;
-			tb_debug(sc, DBG_ROUTER, "Config command timed out, retries=%d\n", retries);
+			tb_printf(sc, "cfgpoll timeout: tx_pici=0x%08x "
+			    "rx_pici=0x%08x tx_tbl=0x%08x\n",
+			    nhi_read_reg(sc->nsc, sc->ring0->tx_pici_reg),
+			    nhi_read_reg(sc->nsc, sc->ring0->rx_pici_reg),
+			    nhi_read_reg(sc->nsc, 0x19800));
 			continue;
 		} else
 			break;
@@ -569,6 +609,23 @@ tb_config_write(struct router_softc *sc, u_int space, u_int adapter,
 		error = msleep(cmd, &sc->mtx, 0, "tbtcfgw", cmd->timeout * hz);
 		if (error != EWOULDBLOCK)
 			break;
+		/* Same interrupt-death rescue as tb_config_read. */
+		mtx_unlock(&sc->mtx);
+		nhi_ring_poll(sc->ring0);
+		mtx_lock(&sc->mtx);
+		if (sc->inflight_cmd != cmd) {
+			if (!sc->ring0->rxpoll_active)
+				tb_printf(sc, "ring0 interrupt not firing - "
+				    "switching ring0 to polling\n");
+			nhi_ring_force_poll(sc->ring0);
+			error = 0;
+			break;
+		}
+		if (nhi_dead(sc->nsc)) {
+			tb_printf(sc, "NHI missing - failing config command\n");
+			error = ENXIO;
+			break;
+		}
 		sc->inflight_cmd = NULL;
 		tb_debug(sc, DBG_ROUTER, "Config write timed out, retries=%d\n",
 		    retries);
@@ -844,12 +901,12 @@ router_hotplug_intr(void *context, union nhi_ring_desc *ring,
 		nhi_free_tx_frame(sc->ring0, ack);
 
 	/*
-	 * A plug means a newly-LOCKED adapter: re-run the HCM walk (its
-	 * taskqueue context can sleep) so the lane gets unlocked and XDomain
-	 * traffic can flow.  taskqueue_enqueue is interrupt-safe.
+	 * Funnel the event onto the serialized HCM link-event task: plug ->
+	 * debounce + unlock/configure walk + peer nudge; unplug -> ordered
+	 * session teardown.  taskqueue_enqueue is interrupt-safe.
 	 */
-	if (!unplug && sc->nsc != NULL && sc->nsc->hcm != NULL)
-		hcm_router_discover(sc->nsc->hcm);
+	if (sc->nsc != NULL && sc->nsc->hcm != NULL)
+		hcm_link_event(sc->nsc->hcm, port, unplug);
 }
 
 /* TX completion for the fire-and-forget hotplug ack: just free the frame. */
