@@ -74,6 +74,9 @@ static int nhi_alloc_ring0(struct nhi_softc *);
 static void nhi_free_ring0(struct nhi_softc *);
 static void nhi_fill_rx_ring(struct nhi_softc *, struct nhi_ring_pair *);
 static void nhi_ring_process(struct nhi_ring_pair *);
+static int nhi_tx_complete(struct nhi_ring_pair *,
+    struct nhi_tx_buffer_desc *, struct nhi_cmd_frame *);
+static int nhi_tx_harvest(struct nhi_ring_pair *);
 static void nhi_rxpoll_timer(void *);
 static int nhi_init(struct nhi_softc *);
 
@@ -168,6 +171,12 @@ nhi_alloc_tx_frame(struct nhi_ring_pair *r)
 	mtx_lock(&r->mtx);
 	cmd = nhi_alloc_tx_frame_locked(r);
 	mtx_unlock(&r->mtx);
+	if (cmd == NULL && nhi_tx_harvest(r) > 0) {
+		/* Free list starved but hardware had finished slots (#69). */
+		mtx_lock(&r->mtx);
+		cmd = nhi_alloc_tx_frame_locked(r);
+		mtx_unlock(&r->mtx);
+	}
 
 	return (cmd);
 }
@@ -178,6 +187,40 @@ nhi_free_tx_frame(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 	mtx_lock(&r->mtx);
 	nhi_free_tx_frame_locked(r, cmd);
 	mtx_unlock(&r->mtx);
+}
+
+/*
+ * Harvest completed TX slots inline, driven by hardware truth (the DONE bit)
+ * instead of waiting for the poll callout's reaper (#69: the callout's
+ * effective granularity starved the 1024-entry TX free list at line rate -
+ * the standalone driver never had a reaper at all, it lazily reused slots on
+ * the submit path exactly like this).  Same lock/complete pattern as the
+ * ring_process TX loop, so the two can run concurrently: slot claim is
+ * serialized under r->mtx, completion runs unlocked.
+ */
+static int
+nhi_tx_harvest(struct nhi_ring_pair *r)
+{
+	struct nhi_tx_buffer_desc *desc;
+	struct nhi_cmd_frame *cmd;
+	int n = 0;
+
+	mtx_lock(&r->mtx);
+	while (r->tx_ci != r->tx_pi) {
+		desc = &r->tx_ring[r->tx_ci].tx;
+		if ((desc->flags_sof & TX_BUFFER_DESC_DONE) == 0)
+			break;
+		cmd = r->tx_cmd_ring[r->tx_ci];
+		r->tx_ci = (r->tx_ci + 1) & r->tx_ring_mask;
+		mtx_unlock(&r->mtx);
+		if (cmd != NULL)
+			nhi_tx_complete(r, desc, cmd);
+		desc->flags_sof = 0;
+		n++;
+		mtx_lock(&r->mtx);
+	}
+	mtx_unlock(&r->mtx);
+	return (n);
 }
 
 /*
@@ -1211,8 +1254,17 @@ nhi_tx_enqueue(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 	desc = &r->tx_ring[r->tx_pi].tx;
 	pi = (r->tx_pi + 1) & r->tx_ring_mask;
 	if (pi == r->tx_ci) {
+		/* Software-full: harvest hardware-completed slots first. */
 		mtx_unlock(&r->mtx);
-		return (EBUSY);
+		if (nhi_tx_harvest(r) == 0)
+			return (EBUSY);
+		mtx_lock(&r->mtx);
+		desc = &r->tx_ring[r->tx_pi].tx;
+		pi = (r->tx_pi + 1) & r->tx_ring_mask;
+		if (pi == r->tx_ci) {
+			mtx_unlock(&r->mtx);
+			return (EBUSY);
+		}
 	}
 	r->tx_cmd_ring[r->tx_pi] = cmd;
 	r->tx_pi = pi;
@@ -1603,6 +1655,15 @@ nhi_ring_process(struct nhi_ring_pair *r)
 		}
 		r->rx_ci = (r->rx_ci + 1) & r->rx_ring_mask;
 		r->rx_pi = (r->rx_pi + 1) & r->rx_ring_mask;
+		/*
+		 * FRAME-mode: return the E2E credit for every consumed frame
+		 * immediately (standalone's per-frame doorbell, #69) - a
+		 * once-per-drain-batch CI write bounds the producer to poll
+		 * cadence and starves the peer's fully-E2E transmitter.
+		 */
+		if (r->frame_mode)
+			nhi_write_reg(sc, r->rx_pici_reg,
+			    r->rx_ci & RX_RING_CI_MASK);
 	}
 
 	/*
@@ -1623,16 +1684,16 @@ nhi_ring_process(struct nhi_ring_pair *r)
 		 */
 		/*
 		 * 32-bit only - this NHI ignores sub-dword MMIO writes (see
-		 * the TX doorbell).  Field ownership asymmetry is tolerated
-		 * by hardware: it latches only the half it doesn't own.
+		 * the TX doorbell).  FRAME-mode rings already returned their
+		 * credits per-frame inside the loop; this batch-end write is
+		 * ring 0's validated combined form.
 		 */
-		if (r->frame_mode)
-			val = r->rx_ci & RX_RING_CI_MASK;
-		else
+		if (!r->frame_mode) {
 			val = r->rx_pi << RX_RING_PI_SHIFT | r->rx_ci;
-		tb_debug(sc, DBG_INTR | DBG_RXQ,
-		    "Writing new RX PICI= 0x%08x\n", val);
-		nhi_write_reg(sc, r->rx_pici_reg, val);
+			tb_debug(sc, DBG_INTR | DBG_RXQ,
+			    "Writing new RX PICI= 0x%08x\n", val);
+			nhi_write_reg(sc, r->rx_pici_reg, val);
+		}
 	}
 
 	/*
