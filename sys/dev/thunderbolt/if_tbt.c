@@ -442,12 +442,26 @@ tbnet_reass(struct tbnet_softc *ts, const uint8_t *payload, u_int len,
 		}
 		ts->rx_m->m_pkthdr.len = 0;
 		ts->rx_m->m_len = 0;
+		/*
+		 * #69: rcvif was never set - this path first became reachable
+		 * with the len==0-means-4096 fix (full-size first fragments
+		 * used to die in the sanity check), and ether_input panics on
+		 * a NULL rcvif ("ifnet mismatch ... rcvif 0").
+		 */
+		ts->rx_m->m_pkthdr.rcvif = ifp;
 		ts->rx_id = id;
 		ts->rx_count = count;
 		ts->rx_index = 0;
 	}
 	if (ts->rx_m == NULL || id != ts->rx_id || count != ts->rx_count ||
 	    index != ts->rx_index) {
+		/* XXX #69 diag: which failure mode dominates?  Sampled. */
+		static u_int reass_errs;
+		if ((reass_errs++ & 0xff) == 0)
+			printf("tbt reass err#%u: got id=%u/cnt=%u/idx=%u "
+			    "want id=%u/cnt=%u/idx=%u\n", reass_errs, id,
+			    count, index, ts->rx_id, ts->rx_count,
+			    ts->rx_index);
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		tbnet_reass_reset(ts);
 		return (NULL);
@@ -529,11 +543,25 @@ tbnet_rx_cb(void *context, union nhi_ring_desc *rdesc,
 		return;
 
 	len = desc->eof_len & RX_BUFFER_DESC_LEN_MASK;
+	/*
+	 * #69: the 12-bit length field wraps - 0 means 4096 (the TX side
+	 * already encodes it that way).  A full-size frame (4084-byte payload
+	 * + 12-byte header) is EXACTLY 4096, so every first fragment of the
+	 * peer's 2-frame packets read len=0 and died in the sanity check:
+	 * ~all bulk RX dropped + reassembly cascade errors.
+	 */
+	if (len == 0)
+		len = TBNET_FRAME_SIZE;
 	fsize = le32dec(frame + TBNET_OFF_SIZE);
 	index = le16dec(frame + TBNET_OFF_INDEX);
 	id = le16dec(frame + TBNET_OFF_ID);
 	count = le32dec(frame + TBNET_OFF_COUNT);
 	if (!tbnet_frame_ok(len, fsize, count)) {
+		/* XXX #69 diag: torn/garbage header?  Sampled. */
+		static u_int hdr_errs;
+		if ((hdr_errs++ & 0xff) == 0)
+			printf("tbt hdr err#%u: len=%u fsize=%u idx=%u id=%u "
+			    "cnt=%u\n", hdr_errs, len, fsize, index, id, count);
 		if_inc_counter(ifp, IFCOUNTER_IERRORS, 1);
 		return;
 	}

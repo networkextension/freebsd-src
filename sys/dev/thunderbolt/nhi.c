@@ -316,6 +316,16 @@ static bool
 nhi_is_icm(struct nhi_softc *sc)
 {
 	uint32_t fwsts = nhi_read_reg(sc, TBT_FW_STATUS);
+	int force_native = 0;
+
+	/*
+	 * hw.nhi.force_native=1: take the SW-CM/native path even when the
+	 * ICM firmware is alive (it comes and goes depending on platform
+	 * mood - the native path is the one we own end to end).
+	 */
+	TUNABLE_INT_FETCH("hw.nhi.force_native", &force_native);
+	if (force_native != 0)
+		return (false);
 
 	/*
 	 * ICM_EN alone is not enough: on integrated parts the bit reads 1

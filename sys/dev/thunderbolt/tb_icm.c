@@ -519,8 +519,13 @@ tb_icm_bringup(void *arg, int pending __unused)
 {
 	struct tb_icm *icm = arg;
 
-	if (icm->dying || icm->paths_approved || !icm->has_peer)
+	if (icm->dying || icm->paths_approved || !icm->has_peer) {
+		/* XXX #69 diag */
+		device_printf(icm->nsc->dev, "bring-up skipped: dying=%d "
+		    "approved=%d has_peer=%d\n", icm->dying,
+		    icm->paths_approved, icm->has_peer);
 		return;
+	}
 	if (icm->native) {
 		/* No ICM: program both hop entries ourselves. */
 		if (tb_icm_program_paths(icm) != 0) {
