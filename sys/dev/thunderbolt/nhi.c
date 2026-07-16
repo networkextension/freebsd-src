@@ -1173,6 +1173,14 @@ nhi_ring_destroy(struct nhi_ring_pair *r)
 	if (r->frames_dmat != NULL)
 		bus_dma_tag_destroy(r->frames_dmat);
 	nhi_free_ring(r);
+	/*
+	 * nhi_free_ring releases the ring's resources but not the ring_pair
+	 * itself, and we already removed it from ring_list above, so the
+	 * detach sweep (nhi_free_rings) can never reach it: free it here or
+	 * leak 32k per data ring on every disconnect (seen as "memory type
+	 * nhi leaked" at kldunload).
+	 */
+	free(r, M_NHI);
 }
 
 static int

@@ -209,6 +209,10 @@ int
 tb_router_attach(struct router_softc *parent, tb_route_t route)
 {
 	struct router_softc *sc;
+	uint64_t this_rt;
+	uint8_t this_hop;
+	bool inserted;
+	int error;
 
 	tb_debug(parent, DBG_ROUTER|DBG_EXTRA, "tb_router_attach called\n");
 
@@ -227,9 +231,28 @@ tb_router_attach(struct router_softc *parent, tb_route_t route)
 	mtx_init(&sc->mtx, "tbcfg", "Thunderbolt Router Config", MTX_DEF);
 	TAILQ_INIT(&sc->cmd_queue);
 
-	router_insert(sc, parent);
+	inserted = (router_insert(sc, parent) == 0);
 
-	return (_tb_router_attach(sc));
+	error = _tb_router_attach(sc);
+	if (error != 0) {
+		/*
+		 * A failed attach (e.g. config-read timeout on an XDomain
+		 * peer that answers no router reads) leaked the softc on
+		 * every hotplug: unlink it if the insert took, then free.
+		 */
+		if (inserted) {
+			this_rt = TB_ROUTE(sc);
+			this_hop = (uint8_t)(this_rt >> (sc->depth * 8));
+			if (this_hop <= parent->max_adap &&
+			    parent->adapters[this_hop] == sc)
+				parent->adapters[this_hop] = NULL;
+		}
+		mtx_destroy(&sc->mtx);
+		if (sc->adapters != NULL)
+			free(sc->adapters, M_THUNDERBOLT);
+		free(sc, M_THUNDERBOLT);
+	}
+	return (error);
 }
 
 int
