@@ -312,6 +312,17 @@ tb_icm_driver_ready(struct tb_icm *icm)
 #define	TB_SWCM_NHI_PORT	7
 #define	TB_SWCM_HOP_CREDITS	14
 #define	TB_SWCM_HOP_DW1		0x0180c501
+/*
+ * TX hop DW1: the ICM's 0x0180c501 is its *RX* (lane->NHI) entry - weight 1,
+ * priority 5, counter_enable, ingress_fc, but egress_fc=0 (bit 25).  Copied
+ * verbatim onto the TX (NHI->lane) hop that leaves the egress toward the wire
+ * un-flow-controlled: a slow peer's full ingress buffer makes our lane
+ * adapter drop frames silently (Titan Ridge Mac: 5700+ TCP rexmits, SMB read
+ * collapse).  Linux tb_dma_init_path enables egress FC on the TX DMA path
+ * (drivers/thunderbolt/tunnel.c); Apple's PathSetup carries an explicit
+ * egress-FC toggle (research: swcm-pathsetup).  So: TX hop gets egress_fc.
+ */
+#define	TB_SWCM_HOP_DW1_TX	(TB_SWCM_HOP_DW1 | (1u << 25))
 
 static int
 tb_icm_program_paths(struct tb_icm *icm)
@@ -342,7 +353,7 @@ tb_icm_program_paths(struct tb_icm *icm)
 	/* TX: NHI(7) HOPS[data TX ring] -> lane, HopID = our announced one. */
 	buf[0] = (icm->local_tx_hopid & 0x7ff) | (lane << 11) |
 	    (TB_SWCM_HOP_CREDITS << 17) | (1u << 31);
-	buf[1] = TB_SWCM_HOP_DW1;
+	buf[1] = TB_SWCM_HOP_DW1_TX;
 	error = tb_config_write(rsc, TB_CFG_CS_PATH, TB_SWCM_NHI_PORT,
 	    ICM_DATA_TX_RING * 2, 2, buf);
 	if (error != 0) {
@@ -694,6 +705,21 @@ tb_icm_tbip_handle(void *ctx, const uint8_t *f, u_int len)
 		icm->login_sent = false;
 		icm->login_tries = 0;
 		icm->logout_kicks = 0;
+	}
+
+	/* Adopt the whole session from a LOGIN when we lost ours across a
+	 * link flap but the peer kept its: it then skips the property
+	 * exchange, so the responder bootstrap never runs, has_peer stays
+	 * false, and bring-up would silently skip after LOGIN COMPLETE. */
+	if (type == TBIP_LOGIN && !icm->has_peer) {
+		icm->peer_route_hi = le32dec(f + 0) & 0x7fffffff;
+		icm->peer_route_lo = le32dec(f + 4);
+		icm->has_peer = true;
+		icm->paths_approved = false;
+		icm->login_tries = icm->logout_kicks = 0;
+		device_printf(icm->nsc->dev,
+		    "tbip: session adopted from peer LOGIN, route %x:%x\n",
+		    icm->peer_route_hi, icm->peer_route_lo);
 	}
 
 	switch (type) {

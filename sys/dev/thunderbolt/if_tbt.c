@@ -27,6 +27,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/callout.h>
 #include <sys/endian.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -67,6 +68,7 @@
 #define	 TBNET_OFF_COUNT	8	/* __le32 frame count (frames in packet) */
 #define	TBNET_MAX_PAYLOAD	(TBNET_FRAME_SIZE - TBNET_HDR_LEN)
 #define	TBNET_MAX_FRAGS		17	/* howmany(64K, TBNET_MAX_PAYLOAD) */
+#define	TBNET_TXQ_LEN		2048	/* software TX queue depth (packets) */
 #define	TBNET_PDF_FRAME_START	1	/* descriptor SOF for a data frame */
 #define	TBNET_PDF_FRAME_END	2	/* descriptor EOF for a data frame */
 
@@ -81,6 +83,13 @@ struct tbnet_softc {
 	uint8_t			peer_mac[ETHER_ADDR_LEN];
 
 	uint16_t		tx_frame_id;	/* per-packet id, incrementing */
+
+	/* Software TX queue: absorbs bursts the (flow-controlled) TX ring
+	 * cannot, instead of dropping on ring-full (#69: multi-stream TCP
+	 * collapsed to Mbit/s on RTO storms).  Guarded by ts->lock; drained
+	 * on every transmit and by the tx_co callout while non-empty. */
+	struct mbufq		tx_q;
+	struct callout		tx_co;
 
 	/* RX reassembly state (touched only by the RX callback). */
 	struct mbuf		*rx_m;
@@ -133,6 +142,8 @@ tbnet_create(struct nhi_softc *nsc, const uint8_t *mac, struct tbnet_softc **tsp
 	ts->nsc = nsc;
 	memcpy(ts->mac, mac, ETHER_ADDR_LEN);
 	mtx_init(&ts->lock, "tbnet", NULL, MTX_DEF);
+	mbufq_init(&ts->tx_q, TBNET_TXQ_LEN);
+	callout_init_mtx(&ts->tx_co, &ts->lock, 0);
 
 	ifp = if_alloc(IFT_ETHER);
 	if (ifp == NULL)
@@ -280,6 +291,8 @@ tbnet_disconnect(struct tbnet_softc *ts)
 	ts->rxring = NULL;
 	ts->txring = NULL;
 	mtx_lock(&ts->lock);
+	callout_stop(&ts->tx_co);
+	mbufq_drain(&ts->tx_q);
 	tbnet_reass_reset(ts);
 	mtx_unlock(&ts->lock);
 }
@@ -289,6 +302,7 @@ void
 tbnet_destroy(struct tbnet_softc *ts)
 {
 	tbnet_disconnect(ts);
+	callout_drain(&ts->tx_co);
 	if (ts->ifp != NULL) {
 		CURVNET_SET(vnet0);		/* no vnet context in the ICM taskq */
 		ether_ifdetach(ts->ifp);
@@ -305,24 +319,21 @@ tbnet_destroy(struct tbnet_softc *ts)
 }
 
 /*
- * if_transmit: fragment one Ethernet frame into ThunderboltIP data frames and
- * schedule each on the TX ring.  MTU 1500 => one frame; the loop also handles
- * the multi-frame (jumbo) case.
+ * Fragment one Ethernet frame into ThunderboltIP data frames and schedule each
+ * on the TX ring.  MTU 1500 => one frame; the loop also handles the multi-frame
+ * (jumbo) case.  ts->lock held.  Consumes the mbuf on every return EXCEPT
+ * ENOBUFS (ring full) - there the caller keeps ownership and queues it.
  */
 static int
-tbnet_transmit(if_t ifp, struct mbuf *m)
+tbnet_encap_locked(struct tbnet_softc *ts, struct mbuf *m)
 {
-	struct tbnet_softc *ts = if_getsoftc(ifp);
+	if_t ifp = ts->ifp;
 	struct nhi_cmd_frame *cmd, *cmds[TBNET_MAX_FRAGS];
 	uint8_t *frame;
 	u_int pktlen, off, index, count, chunk;
 	uint16_t id;
 	int error = 0;
 
-	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0 || ts->txring == NULL) {
-		m_freem(m);		/* no carrier / rings not up (no peer) */
-		return (ENETDOWN);
-	}
 	pktlen = m_length(m, NULL);
 	if (pktlen == 0) {
 		m_freem(m);
@@ -335,9 +346,6 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 		return (EMSGSIZE);
 	}
 
-	ETHER_BPF_MTAP(ifp, m);
-
-	mtx_lock(&ts->lock);
 	/*
 	 * All-or-nothing: reserve every frame up front.  Scheduling a prefix
 	 * and then running out mid-packet strands the peer's reassembly on
@@ -348,10 +356,7 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 		if (cmds[index] == NULL) {
 			while (index > 0)
 				nhi_free_tx_frame(ts->txring, cmds[--index]);
-			mtx_unlock(&ts->lock);
-			if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
-			m_freem(m);
-			return (ENOBUFS);
+			return (ENOBUFS);	/* caller queues m */
 		}
 	}
 	id = ts->tx_frame_id++;
@@ -375,10 +380,19 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 			 * the already-scheduled prefix cannot be recalled. */
 			for (; index < count; index++)
 				nhi_free_tx_frame(ts->txring, cmds[index]);
+			/*
+			 * EBUSY on the FIRST fragment = descriptor ring full
+			 * (1023 usable slots vs 1024 cmd frames - alloc can
+			 * succeed while the ring is at capacity under flow-
+			 * control backpressure).  Nothing is on the wire yet,
+			 * so requeue instead of dropping.  Mid-packet failure
+			 * has a live prefix and must drop the whole packet.
+			 */
+			if (error == EBUSY && off == 0)
+				return (ENOBUFS);	/* caller queues m */
 			break;
 		}
 	}
-	mtx_unlock(&ts->lock);
 
 	if (error == 0) {
 		if_inc_counter(ifp, IFCOUNTER_OPACKETS, 1);
@@ -389,9 +403,92 @@ tbnet_transmit(if_t ifp, struct mbuf *m)
 	return (error);
 }
 
+/* Push queued packets onto the ring until it fills again.  ts->lock held. */
 static void
-tbnet_qflush(if_t ifp __unused)
+tbnet_txq_drain_locked(struct tbnet_softc *ts)
 {
+	struct mbuf *m;
+
+	/*
+	 * Dequeue BEFORE encap: encap consumes (frees) the mbuf on success,
+	 * and mbufq links through m_nextpkt - a peek-then-dequeue order reads
+	 * the freed mbuf's m_nextpkt (UAF panic: GPF in m_length off a stale
+	 * queue head).  On ENOBUFS the mbuf is untouched; put it back in front.
+	 */
+	while ((m = mbufq_dequeue(&ts->tx_q)) != NULL) {
+		if (tbnet_encap_locked(ts, m) == ENOBUFS) {
+			(void)mbufq_prepend(&ts->tx_q, m);
+			break;
+		}
+	}
+}
+
+/* Callout: retry the queue while the ring drains at credit-return rate. */
+static void
+tbnet_txq_timer(void *arg)
+{
+	struct tbnet_softc *ts = arg;		/* ts->lock held (mtx callout) */
+
+	if ((if_getdrvflags(ts->ifp) & IFF_DRV_RUNNING) == 0 ||
+	    ts->txring == NULL) {
+		mbufq_drain(&ts->tx_q);		/* link went down: flush */
+		return;
+	}
+	tbnet_txq_drain_locked(ts);
+	if (mbufq_len(&ts->tx_q) > 0)
+		callout_reset_sbt(&ts->tx_co, SBT_1MS / 2, 0,
+		    tbnet_txq_timer, ts, 0);
+}
+
+/*
+ * if_transmit: send now if the (flow-controlled) TX ring has room, otherwise
+ * queue with backpressure - dropping on ring-full turns peer-paced credit flow
+ * into TCP RTO collapse (#69: 4-stream iperf fell to Mbit/s).
+ */
+static int
+tbnet_transmit(if_t ifp, struct mbuf *m)
+{
+	struct tbnet_softc *ts = if_getsoftc(ifp);
+	int error;
+
+	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0 || ts->txring == NULL) {
+		m_freem(m);		/* no carrier / rings not up (no peer) */
+		return (ENETDOWN);
+	}
+
+	ETHER_BPF_MTAP(ifp, m);
+
+	mtx_lock(&ts->lock);
+	tbnet_txq_drain_locked(ts);
+	if (mbufq_len(&ts->tx_q) == 0) {
+		error = tbnet_encap_locked(ts, m);
+		if (error != ENOBUFS) {
+			mtx_unlock(&ts->lock);
+			return (error);
+		}
+	}
+	/* Ring full (or older packets still queued): keep FIFO order. */
+	error = mbufq_enqueue(&ts->tx_q, m);
+	if (error == 0) {
+		if (!callout_pending(&ts->tx_co))
+			callout_reset_sbt(&ts->tx_co, SBT_1MS / 2, 0,
+			    tbnet_txq_timer, ts, 0);
+	} else {
+		if_inc_counter(ifp, IFCOUNTER_OQDROPS, 1);
+		m_freem(m);
+	}
+	mtx_unlock(&ts->lock);
+	return (error);
+}
+
+static void
+tbnet_qflush(if_t ifp)
+{
+	struct tbnet_softc *ts = if_getsoftc(ifp);
+
+	mtx_lock(&ts->lock);
+	mbufq_drain(&ts->tx_q);
+	mtx_unlock(&ts->lock);
 }
 
 static void
