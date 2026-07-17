@@ -65,6 +65,41 @@
 static void hcm_cfg_task(void *, int);
 static void hcm_link_task(void *, int);
 
+/*
+ * TB3 (Titan/Alpine Ridge) plug-event arming.  Unlike a USB4 router, a TB3
+ * router keeps its ADAPTER config space unreachable and emits NO hotplug
+ * notifications until plug-event delivery is armed on the switch - so the
+ * adapter walk below times out on every read and a cabled peer is never
+ * noticed.
+ *
+ * The exact write was captured by dtrace of IOThunderboltSwitchType3::
+ * enablePlugEvents on the real Titan Ridge (2018 MBP, macOS 15.7): it issues
+ * IOThunderboltController::configModifyDWordWithMask(space=2 ROUTER, port=0,
+ * offset=0x3c, mask=0x04000000, data=0x04000000) on the root switch - a RMW
+ * setting bit 26 at ROUTER config-space offset 0x3c.  Every one of the 13
+ * arm writes seen in a plug capture was byte-identical; there is no per-port
+ * variant.  (An earlier static RE mistook the LC-cap signature 0x10500/mask
+ * 0xffff00 for the arm value; the live trace corrected it.)  USB4 SwitchOS
+ * has no equivalent.  Do this before the adapter walk, TB3 only.
+ */
+static void
+hcm_tb3_enable_lc(struct hcm_softc *hcm)
+{
+	struct router_softc *rsc = hcm->nsc->root_rsc;
+	uint32_t v;
+	int error;
+
+	if ((error = tb_config_router_read(rsc, 0x3c, 1, &v)) != 0) {
+		tb_printf(hcm, "TB3: plug-event arm read failed (%d); adapter "
+		    "config + hotplug will stay dead\n", error);
+		return;
+	}
+	v |= 0x04000000u;			/* bit 26 */
+	error = tb_config_router_write(rsc, 0x3c, 1, &v);
+	tb_printf(hcm, "TB3: plug events armed - router[0x3c] |= bit26 (%d)\n",
+	    error);
+}
+
 int
 hcm_attach(struct nhi_softc *nsc)
 {
@@ -238,6 +273,11 @@ hcm_cfg_task(void *arg, int pending)
 		    u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
 	} else
 		tb_printf(hcm, "Error finding LC registers: %d\n", error);
+
+	/* TB3: bring up the Link Controller so adapter config space responds
+	 * and hotplug notifications fire (USB4 needs none of this). */
+	if ((hcm->nsc->quirks & NHI_QUIRK_TB3) != 0)
+		hcm_tb3_enable_lc(hcm);
 
 	for (i = 1; i <= rsc->max_adap; i++) {
 		error = tb_config_adapter_read(rsc, i, 0, 8, buf);

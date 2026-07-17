@@ -52,6 +52,9 @@
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pci_private.h>
 
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
+
 #include <dev/thunderbolt/tb_reg.h>
 #include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/nhi_var.h>
@@ -141,6 +144,39 @@ nhi_pci_probe(device_t dev)
 	return (ENXIO);
 }
 
+/*
+ * TB3 (Titan Ridge) muxes the port between USB-3 and Thunderbolt.  Apple's
+ * NHIType3::setUSBMode(mode) flips it by evaluating the ACPI method
+ * MUST(mode) on the NHI's ACPI node (0 = Thunderbolt, 1 = USB); the method
+ * is present in Mac ACPI tables (2 instances on a MacBookPro15,1, one per
+ * controller).  Until Thunderbolt mode is asserted the controller behaves
+ * as a USB host: xhci works, but the router forwards no control packets,
+ * adapter config space stays silent and no hotplug events fire (the #77
+ * symptom cluster).  RE: AppleThunderboltNHIType3::setUSBMode +
+ * setupPowerSavings (probes MUST/XRST/RTPC), Sonoma 14.1 x86_64.
+ */
+static void
+nhi_pci_tb3_set_tb_mode(device_t dev)
+{
+	ACPI_HANDLE h;
+	ACPI_OBJECT arg;
+	ACPI_OBJECT_LIST args;
+	ACPI_STATUS s;
+
+	h = acpi_get_handle(dev);
+	if (h == NULL) {
+		device_printf(dev, "TB3: no ACPI handle, cannot set TB mode\n");
+		return;
+	}
+	arg.Type = ACPI_TYPE_INTEGER;
+	arg.Integer.Value = 0;		/* 0 = Thunderbolt, 1 = USB */
+	args.Count = 1;
+	args.Pointer = &arg;
+	s = AcpiEvaluateObject(h, "MUST", &args, NULL);
+	device_printf(dev, "TB3: ACPI MUST(0) (Thunderbolt mode): %s\n",
+	    AcpiFormatException(s));
+}
+
 static int
 nhi_pci_attach(device_t dev)
 {
@@ -180,6 +216,8 @@ nhi_pci_attach(device_t dev)
 		device_printf(dev, "TB3/legacy NHI (dev 0x%04x): attaching "
 		    "(hw.nhi.tb3=1); force-power skipped (SMC/ACPI pre-powers)\n",
 		    pci_get_device(dev));
+		/* Mux the port to Thunderbolt before touching the NHI. */
+		nhi_pci_tb3_set_tb_mode(dev);
 	}
 
 	tb_debug(sc, DBG_INIT|DBG_FULL, "busmaster status was %s\n",
