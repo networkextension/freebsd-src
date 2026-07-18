@@ -64,7 +64,11 @@ struct nhi_cmd_frame {
 #define CMD_RESP_COMPLETE	(1 << 3)
 #define CMD_RESP_OVERRUN	(1 << 4)
 	uint16_t		retries;
-	uint16_t		pdf;
+	uint16_t		pdf;		/* descriptor EOF (and SOF if sof==0) */
+	uint16_t		sof;		/* descriptor SOF; 0 => use pdf.
+					 * FRAME-mode data frames need SOF != EOF
+					 * (ThunderboltIP: SOF=FRAME_START,
+					 * EOF=FRAME_END). */
 	uint16_t		idx;
 
 	void			*context;
@@ -118,6 +122,54 @@ struct nhi_ring_pair {
 	void			*frames;
 	bus_addr_t		tx_frames_busaddr;
 	bus_addr_t		rx_frames_busaddr;
+
+	/*
+	 * Data-ring (non-ring-0) FRAME-mode + E2E options.  Zero for ring 0,
+	 * which runs RAW.  Ported from the nhi_icm data path (nhi_ring.c
+	 * nhi_data_setup); a ThunderboltIP net driver needs a FRAME-mode ring
+	 * pair with end-to-end flow control.
+	 */
+	struct nhi_cmd_frame	*cmds;		/* per-ring frame trackers */
+	u_char			frame_mode;	/* 1 = FRAME, 0 = RAW */
+	u_char			e2e;		/* end-to-end flow control */
+	u_char			e2e_hopid;	/* paired TX hop for RX E2E */
+	uint16_t		sof_mask;	/* RX start-of-frame PDF bitmap */
+	uint16_t		eof_mask;	/* RX end-of-frame PDF bitmap */
+
+	/*
+	 * Optional per-batch RX hook: nhi_ring_process() calls this once after
+	 * draining all pending RX frames, so the client can flush a batched
+	 * delivery (LRO) in one shot instead of per frame (NAPI-style).
+	 */
+	void			(*rx_batch_cb)(void *);
+	void			*rx_batch_ctx;
+
+	/*
+	 * RX poll fallback.  MSI-X allocation is flaky on some hosts (Meteor
+	 * Lake advertises 16 vectors but pci_alloc_msix fails, so the driver
+	 * runs on 2 MSI vectors).  A ring whose number is >= msix_count gets no
+	 * dedicated vector - and no shared tracker either, since the tracker
+	 * array is sized msix_count.  Such a ring is given a private tracker
+	 * (for rxpdf storage) and is drained by a callout instead of an
+	 * interrupt, matching the standalone driver's and macOS's poll path.
+	 */
+	struct callout		rxpoll_co;
+	bool			rxpoll_active;
+	bool			priv_tracker;	/* r->tracker was malloc'd here */
+};
+
+/*
+ * Options for creating a data ring pair (nhi_ring_create).  A ThunderboltIP
+ * data ring is FRAME mode (RAW off) with end-to-end flow control; the RX ring
+ * filters by SOF/EOF PDF and carries the paired TX hop for E2E credit.
+ */
+struct nhi_ring_opts {
+	uint16_t		frame_size;	/* per-frame buffer (e.g. 4096) */
+	uint16_t		sof_mask;	/* RX start-of-frame PDF bitmap */
+	uint16_t		eof_mask;	/* RX end-of-frame PDF bitmap */
+	u_char			frame_mode;	/* 1 = FRAME mode (RAW off) */
+	u_char			e2e;		/* enable end-to-end flow control */
+	u_char			e2e_hopid;	/* paired hop id for RX E2E */
 };
 
 /* PDF-indexed array of dispatch routines for interrupts */
@@ -140,6 +192,7 @@ struct nhi_softc {
 	device_t		dev;
 	device_t		ufp;
 	u_int			debug;
+	u_int			quirks;		/* NHI_QUIRK_* per chip family */
 	u_int			hwflags;
 #define NHI_TYPE_UNKNOWN	0x00
 #define NHI_TYPE_USB4		0x0f
@@ -184,6 +237,8 @@ struct nhi_softc {
 
 	struct intr_config_hook	ich;
 
+	struct tb_icm		*icm;	/* ICM connection manager (ICM mode) */
+
 	uint8_t			uuid[16];
 	uint8_t			lc_uuid[16];
 };
@@ -211,12 +266,26 @@ int nhi_detach(struct nhi_softc *);
 struct nhi_cmd_frame * nhi_alloc_tx_frame(struct nhi_ring_pair *);
 void nhi_free_tx_frame(struct nhi_ring_pair *, struct nhi_cmd_frame *);
 
+/*
+ * Data-ring (non-ring-0) lifecycle for a network/tunnel driver.  create =
+ * allocate ring + FRAME/E2E frame pool + configure; start = fill RX + activate
+ * (routes ring N to its own MSI-X vector via nhi_pci_enable_interrupt); stop =
+ * deactivate; destroy = free.
+ */
+int nhi_ring_create(struct nhi_softc *, u_int ringnum, u_int tx_depth,
+    u_int rx_depth, const struct nhi_ring_opts *, struct nhi_ring_pair **);
+int nhi_ring_start(struct nhi_ring_pair *);
+int nhi_ring_stop(struct nhi_ring_pair *);
+void nhi_ring_destroy(struct nhi_ring_pair *);
+
 int nhi_inmail_cmd(struct nhi_softc *, uint32_t, uint32_t);
 int nhi_outmail_cmd(struct nhi_softc *, uint32_t *);
 
 int nhi_tx_schedule(struct nhi_ring_pair *, struct nhi_cmd_frame *);
 int nhi_tx_synchronous(struct nhi_ring_pair *, struct nhi_cmd_frame *);
 void nhi_intr(void *);
+void nhi_ring_poll(struct nhi_ring_pair *);
+void nhi_ring_force_poll(struct nhi_ring_pair *);
 
 int nhi_register_pdf(struct nhi_ring_pair *, struct nhi_dispatch *,
     struct nhi_dispatch *);
@@ -232,10 +301,39 @@ nhi_read_reg(struct nhi_softc *sc, u_int offset)
 }
 
 static __inline void
+nhi_write_reg_2(struct nhi_softc *sc, u_int offset, uint16_t val)
+{
+	bus_space_write_2(sc->regs_btag, sc->regs_bhandle, offset, val);
+}
+
+/*
+ * "NHI missing" sentinel (Apple guards every register access with
+ * read(0x39640)==0xFFFFFFFF): all-ones from an always-valid register means
+ * the PCI function vanished - e.g. the port renegotiated from Thunderbolt to
+ * USB mode mid-session.  Callers should fail fast and tear down instead of
+ * timing out command-by-command.
+ */
+static __inline bool
+nhi_dead(struct nhi_softc *sc)
+{
+	/* 0x39944 = TBT_FW_STATUS (nhi_reg.h; not all users include it). */
+	return (bus_space_read_4(sc->regs_btag, sc->regs_bhandle,
+	    0x39944) == 0xffffffff);
+}
+
+static __inline void
 nhi_write_reg(struct nhi_softc *sc, u_int offset, uint32_t val)
 {
 	bus_space_write_4(sc->regs_btag, sc->regs_bhandle, offset,
 	    htole32(val));
+	/*
+	 * TB3 (Titan/Alpine Ridge, NHI_QUIRK_TB3 = 1u<<0) needs a posting
+	 * read-back to flush each write: Apple's IntelPCIHAL reads HOST_CAPS
+	 * (0x39640) after every register write, else back-to-back ring-setup
+	 * writes can be lost (RE of AppleThunderboltIntelPCIHAL).
+	 */
+	if ((sc->quirks & (1u << 0)) != 0)
+		(void)bus_space_read_4(sc->regs_btag, sc->regs_bhandle, 0x39640);
 }
 
 static __inline struct nhi_cmd_frame *

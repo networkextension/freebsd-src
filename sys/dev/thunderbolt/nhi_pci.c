@@ -52,6 +52,9 @@
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pci_private.h>
 
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
+
 #include <dev/thunderbolt/tb_reg.h>
 #include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/nhi_var.h>
@@ -59,6 +62,12 @@
 #include <dev/thunderbolt/router_var.h>
 #include <dev/thunderbolt/tb_debug.h>
 #include "tb_if.h"
+
+/* USB4 host-interface PCI programming interface (class 0x0c, subclass 0x03).
+ * Defined in FreeBSD 16's pcireg.h; shim for building on 15.x. */
+#ifndef PCIP_SERIALBUS_USB_USB4
+#define	PCIP_SERIALBUS_USB_USB4	0x40
+#endif
 
 static int	nhi_pci_probe(device_t);
 static int	nhi_pci_attach(device_t);
@@ -91,6 +100,26 @@ static driver_t nhi_pci_driver = {
 DRIVER_MODULE_ORDERED(nhi, pci, nhi_pci_driver, NULL, NULL,
     SI_ORDER_ANY);
 
+/*
+ * Chip-family quirks, keyed on PCI device id (see the device-matrix note).
+ * TB3/legacy NHIs (Titan/Alpine Ridge) have a different BAR0 register map and
+ * force-power window than the integrated USB4 NHIs this driver drives.
+ */
+static u_int
+nhi_device_quirks(uint16_t dev)
+{
+	switch (dev) {
+	case DEVICE_TR_NHI:
+	case DEVICE_AR_2C_NHI:
+	case DEVICE_AR_DP_B_NHI:
+	case DEVICE_AR_DP_C_NHI:
+	case DEVICE_AR_LP_NHI:
+		return (NHI_QUIRK_TB3);
+	default:
+		return (0);
+	}
+}
+
 static int
 nhi_pci_probe(device_t dev)
 {
@@ -102,7 +131,50 @@ nhi_pci_probe(device_t dev)
 		device_set_desc(dev, "Generic USB4 NHI");
 		return (BUS_PROBE_DEFAULT);
 	}
+	/*
+	 * TB3/legacy NHI (Titan/Alpine Ridge).  Its PCI class is 0x088000 (generic
+	 * system peripheral) which is far too broad to match on, so match the
+	 * specific device id.  nhi_attach classifies it via NHI_QUIRK_TB3.
+	 */
+	if (pci_get_vendor(dev) == VENDOR_INTEL &&
+	    pci_get_device(dev) == DEVICE_TR_NHI) {
+		device_set_desc(dev, "Titan Ridge TB3 NHI");
+		return (BUS_PROBE_DEFAULT);
+	}
 	return (ENXIO);
+}
+
+/*
+ * TB3 (Titan Ridge) muxes the port between USB-3 and Thunderbolt.  Apple's
+ * NHIType3::setUSBMode(mode) flips it by evaluating the ACPI method
+ * MUST(mode) on the NHI's ACPI node (0 = Thunderbolt, 1 = USB); the method
+ * is present in Mac ACPI tables (2 instances on a MacBookPro15,1, one per
+ * controller).  Until Thunderbolt mode is asserted the controller behaves
+ * as a USB host: xhci works, but the router forwards no control packets,
+ * adapter config space stays silent and no hotplug events fire (the #77
+ * symptom cluster).  RE: AppleThunderboltNHIType3::setUSBMode +
+ * setupPowerSavings (probes MUST/XRST/RTPC), Sonoma 14.1 x86_64.
+ */
+static void
+nhi_pci_tb3_set_tb_mode(device_t dev)
+{
+	ACPI_HANDLE h;
+	ACPI_OBJECT arg;
+	ACPI_OBJECT_LIST args;
+	ACPI_STATUS s;
+
+	h = acpi_get_handle(dev);
+	if (h == NULL) {
+		device_printf(dev, "TB3: no ACPI handle, cannot set TB mode\n");
+		return;
+	}
+	arg.Type = ACPI_TYPE_INTEGER;
+	arg.Integer.Value = 0;		/* 0 = Thunderbolt, 1 = USB */
+	args.Count = 1;
+	args.Pointer = &arg;
+	s = AcpiEvaluateObject(h, "MUST", &args, NULL);
+	device_printf(dev, "TB3: ACPI MUST(0) (Thunderbolt mode): %s\n",
+	    AcpiFormatException(s));
 }
 
 static int
@@ -119,6 +191,35 @@ nhi_pci_attach(device_t dev)
 	sc->hwflags = NHI_TYPE_USB4;
 	nhi_get_tunables(sc);
 
+	/*
+	 * Classify BEFORE touching the hardware.  A TB3/legacy NHI (Titan/Alpine
+	 * Ridge) differs from the USB4 NHI only in POWER (Mac uses ACPI TRPE +
+	 * SMC pre-power, no VS_CAP force-power) and two write quirks (posting
+	 * read-back, a 20ms-settle 0x39858 reg); the ring/interrupt/caps
+	 * register map is byte-for-byte identical to USB4 (RE of
+	 * AppleThunderboltNHIType3/IntelPCIHAL, Sonoma 14.1).  Attaching maps
+	 * BAR0 + grabs MSI-X; on a Mac the SMC already co-manages the controller,
+	 * so this is gated behind hw.nhi.tb3 (default off) and stays declined
+	 * until explicitly enabled for bring-up.
+	 */
+	sc->quirks = nhi_device_quirks(pci_get_device(dev));
+	if ((sc->quirks & NHI_QUIRK_TB3) != 0) {
+		int tb3 = 0;
+
+		TUNABLE_INT_FETCH("hw.nhi.tb3", &tb3);
+		if (tb3 == 0) {
+			device_printf(dev, "TB3/legacy NHI (dev 0x%04x): experimental "
+			    "- set hw.nhi.tb3=1 to attach (declining for now)\n",
+			    pci_get_device(dev));
+			return (ENXIO);
+		}
+		device_printf(dev, "TB3/legacy NHI (dev 0x%04x): attaching "
+		    "(hw.nhi.tb3=1); force-power skipped (SMC/ACPI pre-powers)\n",
+		    pci_get_device(dev));
+		/* Mux the port to Thunderbolt before touching the NHI. */
+		nhi_pci_tb3_set_tb_mode(dev);
+	}
+
 	tb_debug(sc, DBG_INIT|DBG_FULL, "busmaster status was %s\n",
 	    (pci_read_config(dev, PCIR_COMMAND, 2) & PCIM_CMD_BUSMASTEREN)
 	    ? "enabled" : "disabled");
@@ -131,7 +232,8 @@ nhi_pci_attach(device_t dev)
 			sc->ufp = devclass_get_device(dc, device_get_unit(dev));
 	}
 	if (sc->ufp == NULL)
-		tb_printf(sc, "Cannot find Upstream Facing Port\n");
+		tb_debug(sc, DBG_INIT,
+		    "No Upstream Facing Port (expected on integrated ICM)\n");
 	else
 		tb_printf(sc, "Upstream Facing Port is %s\n",
 		    device_get_nameunit(sc->ufp));

@@ -56,6 +56,7 @@
 #include <dev/thunderbolt/tb_var.h>
 #include <dev/thunderbolt/tbcfg_reg.h>
 #include <dev/thunderbolt/router_var.h>
+#include <dev/thunderbolt/hcm_var.h>
 #include <dev/thunderbolt/tb_debug.h>
 
 static int router_alloc_cmd(struct router_softc *, struct router_command **);
@@ -71,6 +72,8 @@ static int router_schedule_locked(struct router_softc *,
 static nhi_ring_cb_t router_complete_intr;
 static nhi_ring_cb_t router_response_intr;
 static nhi_ring_cb_t router_notify_intr;
+static nhi_ring_cb_t router_hotplug_intr;
+static nhi_ring_cb_t router_plug_ack_txdone;
 
 #define CFG_DEFAULT_RETRIES	3
 #define CFG_DEFAULT_TIMEOUT	2
@@ -191,10 +194,12 @@ router_register_interrupts(struct router_softc *sc)
 {
 	struct nhi_dispatch tx[] = { { PDF_READ, router_complete_intr, sc },
 				     { PDF_WRITE, router_complete_intr, sc },
+				     { PDF_NOTIFY, router_plug_ack_txdone, sc },
 				     { 0, NULL, NULL } };
 	struct nhi_dispatch rx[] = { { PDF_READ, router_response_intr, sc },
 				     { PDF_WRITE, router_response_intr, sc },
 				     { PDF_NOTIFY, router_notify_intr, sc },
+				     { PDF_HOTPLUG, router_hotplug_intr, sc },
 				     { 0, NULL, NULL } };
 
 	return (nhi_register_pdf(sc->ring0, tx, rx));
@@ -204,6 +209,10 @@ int
 tb_router_attach(struct router_softc *parent, tb_route_t route)
 {
 	struct router_softc *sc;
+	uint64_t this_rt;
+	uint8_t this_hop;
+	bool inserted;
+	int error;
 
 	tb_debug(parent, DBG_ROUTER|DBG_EXTRA, "tb_router_attach called\n");
 
@@ -222,9 +231,28 @@ tb_router_attach(struct router_softc *parent, tb_route_t route)
 	mtx_init(&sc->mtx, "tbcfg", "Thunderbolt Router Config", MTX_DEF);
 	TAILQ_INIT(&sc->cmd_queue);
 
-	router_insert(sc, parent);
+	inserted = (router_insert(sc, parent) == 0);
 
-	return (_tb_router_attach(sc));
+	error = _tb_router_attach(sc);
+	if (error != 0) {
+		/*
+		 * A failed attach (e.g. config-read timeout on an XDomain
+		 * peer that answers no router reads) leaked the softc on
+		 * every hotplug: unlink it if the insert took, then free.
+		 */
+		if (inserted) {
+			this_rt = TB_ROUTE(sc);
+			this_hop = (uint8_t)(this_rt >> (sc->depth * 8));
+			if (this_hop <= parent->max_adap &&
+			    parent->adapters[this_hop] == sc)
+				parent->adapters[this_hop] = NULL;
+		}
+		mtx_destroy(&sc->mtx);
+		if (sc->adapters != NULL)
+			free(sc->adapters, M_THUNDERBOLT);
+		free(sc, M_THUNDERBOLT);
+	}
+	return (error);
 }
 
 int
@@ -366,6 +394,25 @@ router_get_config_cb(struct router_softc *sc, struct router_command *cmd,
 	mtx_unlock(&sc->mtx);
 }
 
+/*
+ * Free a timed-out command whose descriptors may still be live in the ring:
+ * orphan the nhi frame (context NULL) instead of recycling it, and let the
+ * late TX/RX completion return it (router_complete_intr).  Recycling it here
+ * let a new command reuse the frame while the old descriptor still referenced
+ * it - the completion then chased a freed router_command (GPF at
+ * 0xdeadc0dedeadc0de in router_complete_intr, seen live).
+ */
+static void
+router_abandon_cmd(struct router_softc *sc, struct router_command *cmd)
+{
+	if (cmd->nhicmd != NULL) {
+		cmd->nhicmd->context = NULL;
+		cmd->nhicmd->resp_buffer = NULL;
+		cmd->nhicmd = NULL;
+	}
+	router_free_cmd(sc, cmd);
+}
+
 int
 tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
     u_int offset, u_int dwlen, uint32_t *buf)
@@ -387,13 +434,40 @@ tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
 		error = msleep(cmd, &sc->mtx, 0, "tbtcfg", cmd->timeout * hz);
 		if (error != EWOULDBLOCK)
 			break;
+		/*
+		 * Timeout.  The ring0 interrupt may be dead (a re-attach after
+		 * kldunload loses vector delivery) - drain the ring by hand,
+		 * like Apple's integrated HAL services rings by poll timer.
+		 * If that completes the command, permanently switch ring0 to
+		 * polling and carry on: degraded, not broken.
+		 */
+		mtx_unlock(&sc->mtx);
+		nhi_ring_poll(sc->ring0);
+		mtx_lock(&sc->mtx);
+		if (sc->inflight_cmd != cmd) {
+			if (!sc->ring0->rxpoll_active)
+				tb_printf(sc, "ring0 interrupt not firing - "
+				    "switching ring0 to polling\n");
+			nhi_ring_force_poll(sc->ring0);
+			error = 0;
+			break;
+		}
+		if (nhi_dead(sc->nsc)) {
+			tb_printf(sc, "NHI missing - failing config command\n");
+			sc->inflight_cmd = NULL;
+			error = ENXIO;
+			break;
+		}
 		sc->inflight_cmd = NULL;
 		tb_debug(sc, DBG_ROUTER, "Config command timed out, retries=%d\n", retries);
 	}
 
 	if (cmd->ev != 0)
 		error = EINVAL;
-	router_free_cmd(sc, cmd);
+	if (error == EWOULDBLOCK || error == ETIMEDOUT || error == ENXIO)
+		router_abandon_cmd(sc, cmd);	/* descriptors may be live */
+	else
+		router_free_cmd(sc, cmd);
 	mtx_unlock(&sc->mtx);
 	return (error);
 }
@@ -424,6 +498,19 @@ tb_config_read_polled(struct router_softc *sc, u_int space, u_int adapter,
 			DELAY(100 * 1000);
 			if ((cmd->flags & RCMD_POLL_COMPLETE) != 0)
 				break;
+			/*
+			 * "Polled" here only spins on a flag the interrupt
+			 * path sets - with a dead ring0 vector (re-attach
+			 * after kldunload) it never completes.  After half
+			 * the timeout with no completion the ISR is
+			 * demonstrably not servicing the ring: drain it by
+			 * hand.  (Never poll while the ISR may be live -
+			 * concurrent nhi_ring_process on one ring corrupts
+			 * the RX single-consumer state; that deadlocked a
+			 * whole attach once.)
+			 */
+			if (timeout <= (cmd->timeout * 1000000) / 2)
+				nhi_ring_poll(sc->ring0);
 			timeout -= 100000;
 		}
 
@@ -431,7 +518,11 @@ tb_config_read_polled(struct router_softc *sc, u_int space, u_int adapter,
 		if ((cmd->flags & RCMD_POLL_COMPLETE) == 0) {
 			error = ETIMEDOUT;
 			sc->inflight_cmd = NULL;
-			tb_debug(sc, DBG_ROUTER, "Config command timed out, retries=%d\n", retries);
+			tb_debug(sc, DBG_ROUTER, "cfgpoll timeout: tx_pici=0x%08x "
+			    "rx_pici=0x%08x tx_tbl=0x%08x\n",
+			    nhi_read_reg(sc->nsc, sc->ring0->tx_pici_reg),
+			    nhi_read_reg(sc->nsc, sc->ring0->rx_pici_reg),
+			    nhi_read_reg(sc->nsc, 0x19800));
 			continue;
 		} else
 			break;
@@ -439,7 +530,10 @@ tb_config_read_polled(struct router_softc *sc, u_int space, u_int adapter,
 
 	if (cmd->ev != 0)
 		error = EINVAL;
-	router_free_cmd(sc, cmd);
+	if (error == EWOULDBLOCK || error == ETIMEDOUT || error == ENXIO)
+		router_abandon_cmd(sc, cmd);	/* descriptors may be live */
+	else
+		router_free_cmd(sc, cmd);
 	mtx_unlock(&sc->mtx);
 	return (error);
 }
@@ -488,12 +582,113 @@ _tb_config_read(struct router_softc *sc, u_int space, u_int adapter,
 	return (0);
 }
 
+/* Mirror of router_prepare_read for a config WRITE request. */
+static void
+router_prepare_write(struct router_softc *sc, struct router_command *cmd,
+    int len)
+{
+	struct nhi_cmd_frame *nhicmd;
+	uint32_t *msg;
+	int msglen, i;
+
+	KASSERT(cmd != NULL, ("cmd cannot be NULL\n"));
+	KASSERT(len % 4 == 0, ("Message must be 32bit padded\n"));
+
+	nhicmd = cmd->nhicmd;
+	msglen = (len - 4) / 4;
+	for (i = 0; i < msglen; i++)
+		nhicmd->data[i] = htobe32(nhicmd->data[i]);
+
+	msg = (uint32_t *)nhicmd->data;
+	msg[msglen] = htobe32(tb_calc_crc(nhicmd->data, len - 4));
+
+	nhicmd->pdf = PDF_WRITE;
+	nhicmd->req_len = len;
+
+	nhicmd->timeout = NHI_CMD_TIMEOUT;
+	nhicmd->retries = 0;
+	nhicmd->resp_buffer = (uint32_t *)cmd->resp_buffer;
+	nhicmd->resp_len = 4 * 4;	/* write resp: route + addr + crc */
+	nhicmd->context = cmd;
+
+	cmd->retries = CFG_DEFAULT_RETRIES;
+	cmd->timeout = CFG_DEFAULT_TIMEOUT;
+}
+
+/*
+ * Synchronous config-space WRITE (upstream left this a stub).  Same
+ * request/response flow as tb_config_read: PDF_WRITE out, the router echoes
+ * a PDF_WRITE response that router_response_intr matches to the inflight
+ * command.  Needed by the native (SW-CM) data path to program hop entries.
+ */
 int
 tb_config_write(struct router_softc *sc, u_int space, u_int adapter,
     u_int offset, u_int dwlen, uint32_t *buf)
 {
+	struct router_command *cmd;
+	struct tb_cfg_write *msg;
+	u_int i;
+	int error, retries;
 
-	return(0);
+	if (dwlen == 0 || dwlen > 60)
+		return (EINVAL);
+
+	if ((error = router_alloc_cmd(sc, &cmd)) != 0)
+		return (error);
+
+	msg = router_get_frame_data(cmd);
+	bzero(msg, sizeof(*msg) + (dwlen + 1) * 4);
+	msg->route.hi = sc->route.hi;
+	msg->route.lo = sc->route.lo;
+	msg->addr_attrs = TB_CONFIG_ADDR(0, space, adapter, dwlen, offset);
+	for (i = 0; i < dwlen; i++)
+		msg->data[i] = buf[i];
+	cmd->callback = router_get_config_cb;
+	cmd->callback_arg = NULL;
+	cmd->dwlen = 0;
+	router_prepare_write(sc, cmd, sizeof(*msg) + (dwlen + 1) * 4);
+
+	retries = cmd->retries;
+	mtx_lock(&sc->mtx);
+	while (retries-- >= 0) {
+		error = router_schedule_locked(sc, cmd);
+		if (error)
+			break;
+
+		error = msleep(cmd, &sc->mtx, 0, "tbtcfgw", cmd->timeout * hz);
+		if (error != EWOULDBLOCK)
+			break;
+		/* Same interrupt-death rescue as tb_config_read. */
+		mtx_unlock(&sc->mtx);
+		nhi_ring_poll(sc->ring0);
+		mtx_lock(&sc->mtx);
+		if (sc->inflight_cmd != cmd) {
+			if (!sc->ring0->rxpoll_active)
+				tb_printf(sc, "ring0 interrupt not firing - "
+				    "switching ring0 to polling\n");
+			nhi_ring_force_poll(sc->ring0);
+			error = 0;
+			break;
+		}
+		if (nhi_dead(sc->nsc)) {
+			tb_printf(sc, "NHI missing - failing config command\n");
+			sc->inflight_cmd = NULL;
+			error = ENXIO;
+			break;
+		}
+		sc->inflight_cmd = NULL;
+		tb_debug(sc, DBG_ROUTER, "Config write timed out, retries=%d\n",
+		    retries);
+	}
+
+	if (cmd->ev != 0)
+		error = EINVAL;
+	if (error == EWOULDBLOCK || error == ETIMEDOUT || error == ENXIO)
+		router_abandon_cmd(sc, cmd);	/* descriptors may be live */
+	else
+		router_free_cmd(sc, cmd);
+	mtx_unlock(&sc->mtx);
+	return (error);
 }
 
 static int
@@ -635,6 +830,13 @@ router_complete_intr(void *context, union nhi_ring_desc *ring,
 	KASSERT(nhicmd != NULL, ("nhicmd cannot be NULL\n"));
 
 	cmd = (struct router_command *)(nhicmd->context);
+	if (cmd == NULL) {
+		/* Late completion of an abandoned (timed-out) command: the
+		 * router_command is gone; just return the orphaned frame. */
+		sc = (struct router_softc *)context;
+		nhi_free_tx_frame(sc->ring0, nhicmd);
+		return;
+	}
 	sc = cmd->sc;
 	tb_debug(sc, DBG_ROUTER|DBG_EXTRA, "router_complete_intr called\n");
 
@@ -712,6 +914,69 @@ router_response_intr(void *context, union nhi_ring_desc *ring, struct nhi_cmd_fr
 	}
 
 	return;
+}
+
+/*
+ * Hot Plug Event (PDF 5), native-CM mode: the router (re)transmits the event
+ * until the CM acknowledges it with a PDF_NOTIFY packet carrying HP_ACK for
+ * that port (Linux tb_cfg_ack_plug / cfg_error_pkg: error[3:0]=7,
+ * port[13:8], pg[31:30]=2 plug / 3 unplug).  Without the ack the event
+ * floods ring 0 several times a second.  The plug/unplug topology work
+ * itself is a later step; ack + log is the required baseline.
+ */
+static void
+router_hotplug_intr(void *context, union nhi_ring_desc *ring,
+    struct nhi_cmd_frame *nhicmd)
+{
+	struct router_softc *sc = context;
+	struct nhi_cmd_frame *ack;
+	uint32_t route_hi, route_lo, ev, port;
+	uint32_t *msg;
+	bool unplug;
+
+	route_hi = be32toh(nhicmd->data[0]) & ~0x80000000u;
+	route_lo = be32toh(nhicmd->data[1]);
+	ev = be32toh(nhicmd->data[2]);
+	port = ev & 0x3f;
+	unplug = (ev & (1u << 31)) != 0;
+
+	tb_printf(sc, "hotplug event: route 0x%08x%08x port %u %s\n",
+	    route_hi, route_lo, port, unplug ? "unplug" : "plug");
+
+	ack = nhi_alloc_tx_frame(sc->ring0);
+	if (ack == NULL) {
+		tb_debug(sc, DBG_ROUTER, "no tx frame for hotplug ack\n");
+		return;
+	}
+	msg = (uint32_t *)ack->data;
+	msg[0] = htobe32(route_hi);
+	msg[1] = htobe32(route_lo);
+	msg[2] = htobe32(TB_CFG_HP_ACK | (port << 8) |
+	    ((unplug ? 3u : 2u) << 30));
+	msg[3] = htobe32(tb_calc_crc(msg, 12));
+	ack->pdf = PDF_NOTIFY;
+	ack->sof = 0;
+	ack->req_len = 16;
+	if (nhi_tx_schedule(sc->ring0, ack) != 0)
+		nhi_free_tx_frame(sc->ring0, ack);
+
+	/*
+	 * Funnel the event onto the serialized HCM link-event task: plug ->
+	 * debounce + unlock/configure walk + peer nudge; unplug -> ordered
+	 * session teardown.  taskqueue_enqueue is interrupt-safe.
+	 */
+	if (sc->nsc != NULL && sc->nsc->hcm != NULL)
+		hcm_link_event(sc->nsc->hcm, port, unplug);
+}
+
+/* TX completion for the fire-and-forget hotplug ack: just free the frame. */
+static void
+router_plug_ack_txdone(void *context, union nhi_ring_desc *ring,
+    struct nhi_cmd_frame *nhicmd)
+{
+	struct router_softc *sc = context;
+
+	nhi_free_tx_frame(sc->ring0, nhicmd);
 }
 
 static void

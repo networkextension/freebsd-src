@@ -59,6 +59,8 @@
 #include <dev/thunderbolt/tbcfg_reg.h>
 #include <dev/thunderbolt/router_var.h>
 #include <dev/thunderbolt/tb_dev.h>
+#include <dev/thunderbolt/tb_icm.h>
+#include <dev/pci/pcivar.h>
 #include "tb_if.h"
 
 static int nhi_alloc_ring(struct nhi_softc *, int, int, int,
@@ -71,7 +73,25 @@ static int nhi_deactivate_ring(struct nhi_ring_pair *);
 static int nhi_alloc_ring0(struct nhi_softc *);
 static void nhi_free_ring0(struct nhi_softc *);
 static void nhi_fill_rx_ring(struct nhi_softc *, struct nhi_ring_pair *);
+static void nhi_ring_process(struct nhi_ring_pair *);
+static int nhi_tx_complete(struct nhi_ring_pair *,
+    struct nhi_tx_buffer_desc *, struct nhi_cmd_frame *);
+static int nhi_tx_harvest(struct nhi_ring_pair *);
+static void nhi_rxpoll_timer(void *);
 static int nhi_init(struct nhi_softc *);
+
+/*
+ * Data-ring RX poll interval, in microseconds.  Apple's NHI runs a
+ * self-re-arming IOTimerEventSource at a tunable interval (tbpollinterval,
+ * default 1000us) and batch-drains the ring each fire.  We are poll-only here
+ * (per-ring MSI-X is unreliable on this hardware), so we mirror that model but
+ * default lower and use callout_reset_sbt for sub-ms resolution (a plain
+ * callout is tick-granular, ~1ms, which rate-limits sustained RX/E2E credit
+ * return).  Tunable: hw.nhi_rxpoll_us.
+ */
+static int nhi_rxpoll_us = 250;
+SYSCTL_INT(_hw, OID_AUTO, nhi_rxpoll_us, CTLFLAG_RWTUN, &nhi_rxpoll_us, 0,
+    "Thunderbolt NHI data-ring RX poll interval (microseconds)");
 static void nhi_post_init(void *);
 static int nhi_tx_enqueue(struct nhi_ring_pair *, struct nhi_cmd_frame *);
 static int nhi_setup_sysctl(struct nhi_softc *);
@@ -83,6 +103,10 @@ MALLOC_DEFINE(M_NHI, "nhi", "nhi driver memory");
 #ifndef NHI_DEBUG_LEVEL
 #define NHI_DEBUG_LEVEL 0
 #endif
+
+/* Force-power poll: NHI_FORCE_POWER_RETRIES x 3ms DELAY = ~1.05s max wait for
+ * the controller firmware to report FW_READY (it short-circuits once ready). */
+#define NHI_FORCE_POWER_RETRIES 350
 
 void
 nhi_get_tunables(struct nhi_softc *sc)
@@ -147,6 +171,12 @@ nhi_alloc_tx_frame(struct nhi_ring_pair *r)
 	mtx_lock(&r->mtx);
 	cmd = nhi_alloc_tx_frame_locked(r);
 	mtx_unlock(&r->mtx);
+	if (cmd == NULL && nhi_tx_harvest(r) > 0) {
+		/* Free list starved but hardware had finished slots (#69). */
+		mtx_lock(&r->mtx);
+		cmd = nhi_alloc_tx_frame_locked(r);
+		mtx_unlock(&r->mtx);
+	}
 
 	return (cmd);
 }
@@ -160,10 +190,45 @@ nhi_free_tx_frame(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 }
 
 /*
+ * Harvest completed TX slots inline, driven by hardware truth (the DONE bit)
+ * instead of waiting for the poll callout's reaper (#69: the callout's
+ * effective granularity starved the 1024-entry TX free list at line rate -
+ * the standalone driver never had a reaper at all, it lazily reused slots on
+ * the submit path exactly like this).  Same lock/complete pattern as the
+ * ring_process TX loop, so the two can run concurrently: slot claim is
+ * serialized under r->mtx, completion runs unlocked.
+ */
+static int
+nhi_tx_harvest(struct nhi_ring_pair *r)
+{
+	struct nhi_tx_buffer_desc *desc;
+	struct nhi_cmd_frame *cmd;
+	int n = 0;
+
+	mtx_lock(&r->mtx);
+	while (r->tx_ci != r->tx_pi) {
+		desc = &r->tx_ring[r->tx_ci].tx;
+		if ((desc->flags_sof & TX_BUFFER_DESC_DONE) == 0)
+			break;
+		cmd = r->tx_cmd_ring[r->tx_ci];
+		r->tx_ci = (r->tx_ci + 1) & r->tx_ring_mask;
+		mtx_unlock(&r->mtx);
+		if (cmd != NULL)
+			nhi_tx_complete(r, desc, cmd);
+		desc->flags_sof = 0;
+		n++;
+		mtx_lock(&r->mtx);
+	}
+	mtx_unlock(&r->mtx);
+	return (n);
+}
+
+/*
  * Push a command and data dword through the mailbox to the firmware.
  * Response is either good, error, or timeout.  Commands that return data
  * do so by reading OUTMAILDATA.
  */
+/* Unused today; kept as the SETMODE mailbox primitive for future use. */
 int
 nhi_inmail_cmd(struct nhi_softc *sc, uint32_t cmd, uint32_t data)
 {
@@ -225,6 +290,7 @@ nhi_inmail_cmd(struct nhi_softc *sc, uint32_t cmd, uint32_t data)
 /*
  * Pull command status and data from the firmware mailbox.
  */
+/* Unused today; kept as the opmode/OUTMAIL read primitive for future use. */
 int
 nhi_outmail_cmd(struct nhi_softc *sc, uint32_t *val)
 {
@@ -233,6 +299,88 @@ nhi_outmail_cmd(struct nhi_softc *sc, uint32_t *val)
 		return (EINVAL);
 	*val = nhi_read_reg(sc, TBT_OUTMAILCMD);
 	return (0);
+}
+
+/*
+ * Does this controller run the firmware ICM (Internal Connection Manager)?
+ * Runtime probe of the always-on FW status register (bit 0 = ICM/CM firmware
+ * enabled), which is readable before force-power - unlike the OUTMAIL opmode,
+ * which reads SAFE until the CM is woken by force-power + DRIVER_READY.  This
+ * replaces a PCI device-ID whitelist so every ICM-capable controller (Meteor
+ * Lake, Ice Lake, Tiger Lake, AMD Pink Sardine, ...) auto-selects the ICM path,
+ * while native-USB4 controllers (bit clear) fall through to hcm_attach.  Stable
+ * across attach, so both call sites (the force-power gate and the CM-selection
+ * branch) return the same value.
+ */
+static bool
+nhi_is_icm(struct nhi_softc *sc)
+{
+	uint32_t fwsts = nhi_read_reg(sc, TBT_FW_STATUS);
+	int force_native = 0;
+
+	/*
+	 * hw.nhi.force_native=1: take the SW-CM/native path even when the
+	 * ICM firmware is alive (it comes and goes depending on platform
+	 * mood - the native path is the one we own end to end).
+	 */
+	TUNABLE_INT_FETCH("hw.nhi.force_native", &force_native);
+	if (force_native != 0)
+		return (false);
+
+	/*
+	 * ICM_EN alone is not enough: on integrated parts the bit reads 1
+	 * even when the ICM firmware never booted (fw_sts 0x00000121 with
+	 * nothing to start it - historically Windows' Intel driver did).
+	 * Linux icm_tgl_is_supported gates ICL/TGL/ADL/MTL on NVM_AUTH_DONE
+	 * (bit 31, our FWSTATUS_CM_READY) and otherwise runs its software
+	 * CM; without it the controller is in native USB4 mode and must
+	 * take the HCM path - ICM commands only draw pdf-3 error packets.
+	 */
+	return ((fwsts & (FWSTATUS_ENABLE | FWSTATUS_CM_READY)) ==
+	    (FWSTATUS_ENABLE | FWSTATUS_CM_READY));
+}
+
+/*
+ * Force-power an integrated (Meteor Lake) controller via the vendor-specific
+ * PCI-config registers and wait for firmware-ready.  Without this the on-die
+ * controller stays powered off and the ICM never answers ring 0.  Ported from
+ * the standalone nhi_icm driver; the in-tree driver otherwise uses the ACPI-WMI
+ * force-power path (nhi_wmi.c).
+ */
+static int
+nhi_force_power(struct nhi_softc *sc)
+{
+	uint32_t vs22, vs9;
+	int retries;
+
+	vs22 = pci_read_config(sc->dev, NHI_VS_CAP_22, 4);
+	vs22 &= ~NHI_VS_CAP_22_DMA_DELAY_MASK;
+	vs22 |= (NHI_VS_CAP_22_DMA_DELAY_VAL << NHI_VS_CAP_22_DMA_DELAY_SHIFT);
+	vs22 |= NHI_VS_CAP_22_FORCE_POWER;
+	pci_write_config(sc->dev, NHI_VS_CAP_22, vs22, 4);
+
+	for (retries = NHI_FORCE_POWER_RETRIES; retries > 0; retries--) {
+		vs9 = pci_read_config(sc->dev, NHI_VS_CAP_9, 4);
+		if ((vs9 & NHI_VS_CAP_9_FW_READY) != 0) {
+			tb_printf(sc, "force-power: FW ready after %d ms\n",
+			    (NHI_FORCE_POWER_RETRIES - retries) * 3);
+			return (0);
+		}
+		DELAY(3000);
+	}
+	tb_printf(sc, "force-power: FW not ready (VS_CAP_9=0x%08x)\n", vs9);
+	return (ETIMEDOUT);
+}
+
+/* ICM-mode init: config hook fires once interrupts are live -> DRIVER_READY. */
+static void
+nhi_icm_post_init(void *arg)
+{
+	struct nhi_softc *sc = arg;
+
+	if (tb_icm_init(sc, sc->ring0, &sc->icm) != 0)
+		tb_printf(sc, "ICM init failed\n");
+	config_intrhook_disestablish(&sc->ich);
 }
 
 int
@@ -245,6 +393,29 @@ nhi_attach(struct nhi_softc *sc)
 		return (error);
 
 	mtx_init(&sc->nhi_mtx, "nhimtx", "NHI Control Mutex", MTX_DEF);
+
+	/*
+	 * Connection-manager selection is firmware-driven (nhi_is_icm reads the
+	 * FW status register).  Log it, then force-power ICM controllers before
+	 * touching the host-caps register: integrated parts keep the on-die CM
+	 * powered down until asserted, and the firmware will not answer ring 0
+	 * (DRIVER_READY) until then.
+	 */
+	tb_printf(sc, "icm=%s (fw_status=0x%08x)\n",
+	    nhi_is_icm(sc) ? "present" : "absent",
+	    nhi_read_reg(sc, TBT_FW_STATUS));
+	/*
+	 * Force-power is a USB4-only path (VS_CAP_22 bit in PCI config).  TB3
+	 * (Titan/Alpine Ridge) powers differently: Mac evaluates ACPI TRPE and
+	 * the SMC already leaves the controller D0 + bus-master at OS boot (RE:
+	 * NHIType3::enablePower is a no-op, prePCIWake runs ACPI TRPE).  So
+	 * never run the USB4 force-power on TB3 - the controller is already
+	 * powered, and writing VS_CAP on TB3 would poke the wrong register.
+	 * (On Mac TB3 nhi_is_icm is false anyway - ICM_EN=0 - so it takes the
+	 * native/SW-CM path below.)
+	 */
+	if (nhi_is_icm(sc) && (sc->quirks & NHI_QUIRK_TB3) == 0)
+		(void)nhi_force_power(sc);
 
 	/*
 	 * Get the number of TX/RX paths.  This sizes some of the register
@@ -273,10 +444,24 @@ nhi_attach(struct nhi_softc *sc)
 	if (error == 0)
 		error = tbdev_add_interface(sc);
 
-	error = hcm_attach(sc);
-
-	if (error == 0)
-		error = nhi_init(sc);
+	/*
+	 * Connection-manager selection.  Integrated ICM controllers run the
+	 * firmware CM: set the DMA interrupt auto-ACK and defer DRIVER_READY to
+	 * a config hook (it needs live interrupts for the CM_RESP callback), and
+	 * skip the HCM router walk entirely.  Everything else runs the in-tree
+	 * software CM (HCM).
+	 */
+	if (error == 0 && nhi_is_icm(sc)) {
+		val = nhi_read_reg(sc, NHI_DMA_MISC);
+		nhi_write_reg(sc, NHI_DMA_MISC, val | DMA_MISC_INT_AUTOCLEAR);
+		sc->ich.ich_func = nhi_icm_post_init;
+		sc->ich.ich_arg = sc;
+		error = config_intrhook_establish(&sc->ich);
+	} else {
+		error = hcm_attach(sc);
+		if (error == 0)
+			error = nhi_init(sc);
+	}
 
 	return (error);
 }
@@ -284,10 +469,24 @@ nhi_attach(struct nhi_softc *sc)
 int
 nhi_detach(struct nhi_softc *sc)
 {
+	/*
+	 * The managers are independent now (native mode runs the HCM walk
+	 * AND the XDomain/TBIP stack); tear down whichever exist.
+	 * hcm_detach is NULL-safe - an ICM-mode controller whose
+	 * tb_icm_init failed has neither manager, and blindly detaching
+	 * the HCM used to dereference the NULL sc->hcm (kldunload panic,
+	 * hcm_detach+0x4).
+	 */
+	/* hcm first: its taskqueue's link task dereferences sc->icm. */
 	hcm_detach(sc);
-
-	if (sc->root_rsc != NULL)
+	if (sc->icm != NULL) {
+		tb_icm_fini(sc->icm);
+		sc->icm = NULL;
+	}
+	if (sc->root_rsc != NULL) {
 		tb_router_detach(sc->root_rsc);
+		sc->root_rsc = NULL;
+	}
 
 	tbdev_remove_interface(sc);
 
@@ -409,6 +608,20 @@ nhi_free_ring(struct nhi_ring_pair *r)
 {
 
 	tb_debug(r->sc, DBG_INIT, "Freeing ring %d resources\n", r->ring_num);
+
+	/*
+	 * Stop the RX poll callout before any teardown.  It re-arms itself and
+	 * calls nhi_ring_process(), which locks r->mtx - so if it fires after
+	 * mtx_destroy() below it panics with "mtx_lock() of destroyed mutex".
+	 * Clear rxpoll_active first so an in-flight timer returns without
+	 * re-arming, then drain.  Done here (not just in the stop path) so the
+	 * detach path (nhi_free_rings -> nhi_free_ring) is covered too.  Safe on
+	 * a never-armed callout (callout_init ran at ring creation), and no lock
+	 * is held here so callout_drain cannot deadlock against the timer.
+	 */
+	r->rxpoll_active = false;
+	callout_drain(&r->rxpoll_co);
+
 	nhi_deactivate_ring(r);
 
 	if (r->tx_ring_busaddr != 0) {
@@ -447,9 +660,21 @@ nhi_configure_ring(struct nhi_softc *sc, struct nhi_ring_pair *ring)
 {
 	bus_addr_t busaddr;
 	uint32_t val;
-	int idx;
+	int idx, tblidx;
 
 	idx = ring->ring_num * 16;
+
+	/*
+	 * Reset both halves of the TX/RX index registers while the ring is
+	 * inactive - this is the one place a full 32-bit write is correct.
+	 * A re-attach (kldunload/kldload, tb-bridge reload) inherits the
+	 * previous instance's PI/CI here; the running-state doorbells only
+	 * touch their own 16-bit half (#69), so stale values would otherwise
+	 * persist and the engine never transmits (root-router config reads
+	 * time out with err 60 on the second attach of a boot).
+	 */
+	nhi_write_reg(sc, ring->tx_pici_reg, 0);
+	nhi_write_reg(sc, ring->rx_pici_reg, 0);
 
 	/* Program the TX ring address and size */
 	busaddr = ring->tx_ring_busaddr;
@@ -460,13 +685,33 @@ nhi_configure_ring(struct nhi_softc *sc, struct nhi_ring_pair *ring)
 	tb_debug(sc, DBG_INIT, "TX Ring %d TX_RING_SIZE= 0x%x\n",
 	    ring->ring_num, ring->tx_ring_depth);
 
-	/* Program the RX ring address and size */
+	/* Program the RX ring address and size.  Only RAW rings (ring 0) carry
+	 * the RX max-frame in [31:16]; FRAME-mode data rings size their buffers
+	 * per-descriptor and must leave it 0 - the proven nhi_icm data path sets
+	 * it only for !frame_mode, and setting it here starves the data ring. */
 	busaddr = ring->rx_ring_busaddr;
-	val = (ring->rx_buffer_size << 16) | ring->rx_ring_depth;
+	if (ring->frame_mode)
+		val = ring->rx_ring_depth;
+	else
+		val = (ring->rx_buffer_size << 16) | ring->rx_ring_depth;
 	nhi_write_reg(sc, NHI_RX_RING_ADDR_LO + idx, busaddr & 0xffffffff);
 	nhi_write_reg(sc, NHI_RX_RING_ADDR_HI + idx, busaddr >> 32);
 	nhi_write_reg(sc, NHI_RX_RING_SIZE + idx, val);
-	nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE1 + idx, 0xffffffff);
+
+	/*
+	 * RX table BASE1 = the SOF/EOF PDF match masks (FRAME mode), or
+	 * accept-all (RAW).  The *table* registers use a ring_num*32 stride, not
+	 * the *16 of the addr/size registers above; the original code wrote
+	 * BASE1 at idx (=*16), correct only for ring 0.  In FRAME mode the masks
+	 * come from the ring opts (sof_mask<<16 | eof_mask), per the nhi_icm data
+	 * path (nhi_ring.c nhi_ring_program).
+	 */
+	tblidx = ring->ring_num * 32;
+	if (ring->frame_mode)
+		nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE1 + tblidx,
+		    ((uint32_t)ring->sof_mask << 16) | ring->eof_mask);
+	else
+		nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE1 + tblidx, 0xffffffff);
 	tb_debug(sc, DBG_INIT, "RX Ring %d RX_RING_SIZE= 0x%x\n",
 	    ring->ring_num, val);
 
@@ -477,17 +722,68 @@ static int
 nhi_activate_ring(struct nhi_ring_pair *ring)
 {
 	struct nhi_softc *sc = ring->sc;
+	uint32_t txflags, rxflags;
 	int idx;
 
-	nhi_pci_enable_interrupt(ring);
+	/*
+	 * Only the control ring (0) is interrupt-driven.  Data rings are always
+	 * serviced by the poll (nhi_ring_start), because their per-ring MSI-X
+	 * vectors are unreliable on this hardware.  We must NOT also enable their
+	 * interrupt: on a controller where the vector does fire (e.g. ring 1's TX
+	 * completions), the ISR and the poll would both run nhi_ring_process on
+	 * the same ring and corrupt its indices - that page-faulted under load.
+	 */
+	if (ring->ring_num == 0)
+		nhi_pci_enable_interrupt(ring);
 
 	idx = ring->ring_num * 32;
 	tb_debug(sc, DBG_INIT, "Activating ring %d at idx %d\n",
 	    ring->ring_num, idx);
-	nhi_write_reg(sc, NHI_TX_RING_TABLE_BASE0 + idx,
-	    TX_TABLE_RAW | TX_TABLE_VALID);
-	nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE0 + idx,
-	    RX_TABLE_RAW | RX_TABLE_VALID);
+
+	if (!ring->frame_mode) {
+		/* RAW mode (control ring 0): accept every PDF. */
+		nhi_write_reg(sc, NHI_TX_RING_TABLE_BASE0 + idx,
+		    TX_TABLE_RAW | TX_TABLE_VALID);
+		nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE0 + idx,
+		    RX_TABLE_RAW | RX_TABLE_VALID);
+		/*
+		 * Zero both PI/CI halves now that the ring is VALID - index
+		 * writes are ignored on an invalid ring, and a re-attach
+		 * (prior instance detached, or its attach failed) inherits
+		 * stale indices that stall the TX engine forever (config
+		 * reads err 60).  Safe here: enabled but idle, nothing
+		 * posted yet.
+		 */
+		nhi_write_reg(sc, ring->tx_pici_reg, 0);
+		nhi_write_reg(sc, ring->rx_pici_reg, 0);
+		return (0);
+	}
+
+	/*
+	 * FRAME mode + E2E (ThunderboltIP data path), ported from the nhi_icm
+	 * data path (nhi_ring.c nhi_ring_program frame branch).  The NHI
+	 * requires the ring VALID bit to be live BEFORE E2E is armed: write
+	 * VALID alone first, then OR in the E2E bit (and, on RX, the paired TX
+	 * hop id at bits [22:12]).  Writing them together leaves E2E unarmed, no
+	 * credits ever flow, and the peer's (fully-E2E) transmitter never puts a
+	 * frame on the wire.  RAW is left clear.  The RX SOF/EOF match masks were
+	 * programmed into BASE1 by nhi_configure_ring.
+	 */
+	txflags = TX_TABLE_VALID;
+	rxflags = RX_TABLE_VALID;
+	nhi_write_reg(sc, NHI_TX_RING_TABLE_BASE0 + idx, txflags);
+	nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE0 + idx, rxflags);
+	if (ring->e2e) {
+		txflags |= TX_TABLE_E2E;
+		rxflags |= RX_TABLE_E2E |
+		    (((uint32_t)ring->e2e_hopid << RX_TABLE_E2E_HOPID_SHIFT) &
+		    RX_TABLE_E2E_HOPID_MASK);
+		nhi_write_reg(sc, NHI_TX_RING_TABLE_BASE0 + idx, txflags);
+		nhi_write_reg(sc, NHI_RX_RING_TABLE_BASE0 + idx, rxflags);
+	}
+	/* See the RAW branch: reset stale indices once VALID, before use. */
+	nhi_write_reg(sc, ring->tx_pici_reg, 0);
+	nhi_write_reg(sc, ring->rx_pici_reg, 0);
 
 	return (0);
 }
@@ -508,6 +804,16 @@ nhi_deactivate_ring(struct nhi_ring_pair *r)
 	tb_debug(sc, DBG_INIT, "Setting ring %d sizes to 0\n", r->ring_num);
 	nhi_write_reg(sc, NHI_TX_RING_SIZE + idx, 0);
 	nhi_write_reg(sc, NHI_RX_RING_SIZE + idx, 0);
+
+	/*
+	 * Zero both index registers on the way down, like Linux tb_ring_stop.
+	 * Index writes are ignored while a ring is torn down/invalid, so this
+	 * is the only reliable point - stale PI/CI here made every re-attach
+	 * time out its config reads (TX engine saw PI=1 vs old CI=N and never
+	 * transmitted).
+	 */
+	nhi_write_reg(sc, r->tx_pici_reg, 0);
+	nhi_write_reg(sc, r->rx_pici_reg, 0);
 
 	return (0);
 }
@@ -660,6 +966,223 @@ nhi_fill_rx_ring(struct nhi_softc *sc, struct nhi_ring_pair *rp)
 	return;
 }
 
+/*
+ * Allocate a per-ring frame pool for a data ring: frame_size-byte buffers for
+ * tx_depth + rx_depth frames, plus cmd trackers, seeding the RX and TX free
+ * lists.  Mirrors nhi_alloc_ring0's frame setup, but uses the ring's own
+ * frames_dmat (ring 0 uses sc->ring0_dmat) and a caller-chosen frame size, and
+ * gives every TX slot a buffer (ring 0 leaves the last one unmapped).
+ */
+static int
+nhi_alloc_ring_frames(struct nhi_softc *sc, struct nhi_ring_pair *r,
+    u_int frame_size)
+{
+	bus_dma_template_t t;
+	bus_addr_t busaddr;
+	struct nhi_cmd_frame *cmd;
+	char *frames;
+	int size, i, ntot;
+
+	r->rx_buffer_size = frame_size;
+	ntot = r->tx_ring_depth + r->rx_ring_depth;
+	size = ntot * frame_size;
+
+	bus_dma_template_init(&t, sc->parent_dmat);
+	t.maxsize = t.maxsegsize = size;
+	t.nsegments = 1;
+	if (bus_dma_template_tag(&t, &r->frames_dmat) != 0) {
+		tb_printf(sc, "Error allocating data ring buffer tag\n");
+		return (ENOMEM);
+	}
+	if (bus_dmamem_alloc(r->frames_dmat, (void **)&frames, BUS_DMA_NOWAIT,
+	    &r->frames_map) != 0) {
+		tb_printf(sc, "Error allocating data ring memory\n");
+		return (ENOMEM);
+	}
+	bzero(frames, size);
+	bus_dmamap_load(r->frames_dmat, r->frames_map, frames, size,
+	    nhi_memaddr_cb, &busaddr, 0);
+	r->frames = frames;
+	r->rx_frames_busaddr = busaddr;
+
+	r->cmds = malloc(sizeof(struct nhi_cmd_frame) * ntot, M_NHI,
+	    M_NOWAIT | M_ZERO);
+	if (r->cmds == NULL)
+		return (ENOMEM);
+
+	mtx_lock(&r->mtx);
+	for (i = 0; i < r->rx_ring_depth; i++) {		/* RX frames */
+		cmd = &r->cmds[i];
+		cmd->data = (uint32_t *)(frames + frame_size * i);
+		cmd->data_busaddr = busaddr + frame_size * i;
+		cmd->flags = CMD_MAPPED;
+		cmd->idx = i;
+		TAILQ_INSERT_TAIL(&r->rx_head, cmd, cm_link);
+	}
+	for ( ; i < ntot; i++) {				/* TX frames */
+		cmd = &r->cmds[i];
+		cmd->data = (uint32_t *)(frames + frame_size * i);
+		cmd->data_busaddr = busaddr + frame_size * i;
+		cmd->flags = CMD_MAPPED;
+		cmd->idx = i;
+		nhi_free_tx_frame_locked(r, cmd);
+	}
+	mtx_unlock(&r->mtx);
+
+	return (0);
+}
+
+/*
+ * Public data-ring lifecycle (nhi_var.h).  A ThunderboltIP / tunnel net driver
+ * uses these to stand up a FRAME-mode, E2E ring pair on a non-zero ring number,
+ * which is routed to its own MSI-X vector by nhi_pci_enable_interrupt (see
+ * nhi_activate_ring).  This is the transport half of ROADMAP.md Step 1.
+ */
+int
+nhi_ring_create(struct nhi_softc *sc, u_int ringnum, u_int tx_depth,
+    u_int rx_depth, const struct nhi_ring_opts *opts, struct nhi_ring_pair **rp)
+{
+	struct nhi_ring_pair *r;
+	u_int frame_size;
+	int error;
+
+	/* nhi_alloc_ring gates on max_ring_count; grow it for this ring. */
+	if (ringnum >= sc->max_ring_count)
+		sc->max_ring_count = ringnum + 1;
+
+	if ((error = nhi_alloc_ring(sc, ringnum, tx_depth, rx_depth, &r)) != 0)
+		return (error);
+
+	r->frame_mode = opts->frame_mode;
+	r->e2e = opts->e2e;
+	r->e2e_hopid = opts->e2e_hopid;
+	r->sof_mask = opts->sof_mask;
+	r->eof_mask = opts->eof_mask;
+
+	frame_size = opts->frame_size ? opts->frame_size : NHI_RING0_FRAME_SIZE;
+	if ((error = nhi_alloc_ring_frames(sc, r, frame_size)) != 0) {
+		nhi_free_ring(r);
+		return (error);
+	}
+
+	/*
+	 * Bind ring N to interrupt tracker N (1:1, as ring 0 does).  Requires
+	 * MSI-X to have come up with more than one vector; without it the ring
+	 * still works under the shared/poll path.
+	 */
+	if (ringnum < sc->msix_count) {
+		sc->intr_trackers[ringnum].ring = r;
+		r->tracker = &sc->intr_trackers[ringnum];
+	} else {
+		/*
+		 * No MSI-X vector for this ring, and no shared tracker slot
+		 * either (the tracker array is sized msix_count).  Give it a
+		 * private tracker so rxpdf callbacks have somewhere to live, and
+		 * drain it by polling (nhi_ring_start) instead of by interrupt.
+		 */
+		r->tracker = malloc(sizeof(*r->tracker), M_NHI,
+		    M_ZERO | M_NOWAIT);
+		if (r->tracker == NULL) {
+			nhi_free_ring(r);
+			return (ENOMEM);
+		}
+		r->tracker->sc = sc;
+		r->tracker->ring = r;
+		r->priv_tracker = true;
+	}
+	callout_init(&r->rxpoll_co, 1);
+
+	SLIST_INSERT_HEAD(&sc->ring_list, r, ring_link);
+	*rp = r;
+	return (0);
+}
+
+int
+nhi_ring_start(struct nhi_ring_pair *r)
+{
+	struct nhi_softc *sc = r->sc;
+	int error;
+
+	if ((error = nhi_configure_ring(sc, r)) != 0)
+		return (error);
+	/*
+	 * Activate (set the ring VALID + arm E2E) BEFORE posting RX buffers.
+	 * nhi_fill_rx_ring's doorbell write publishes the posted-buffer count,
+	 * which the fabric uses as the initial E2E credit grant to the peer.
+	 * If buffers are posted while the ring is not yet VALID, the hardware
+	 * discards the producer update and the ring advertises 0 credits - the
+	 * peer's fully E2E-gated ThunderboltIP transmitter then never puts a
+	 * frame on the wire (Mac->FreeBSD RX = 0, while TX and login are fine).
+	 * Ring 0 and the proven standalone both activate-then-fill; the earlier
+	 * fill-then-activate order here latched RX credits at zero.
+	 */
+	if ((error = nhi_activate_ring(r)) != 0)
+		return (error);
+	nhi_fill_rx_ring(sc, r);
+	/*
+	 * Service data rings by polling.  On this hardware the per-ring MSI-X
+	 * vectors do not fire even when pci_alloc_msix reports many vectors -
+	 * only vector 0 (the control ring) is reliable - so a data ring that
+	 * relied on its dedicated vector would never be serviced (RX dead, TX
+	 * completions never reclaimed).  nhi_ring_start is only called for data
+	 * rings (ring 0 is brought up directly in nhi_attach and keeps its
+	 * working vector-0 interrupt).  This matches the standalone driver's
+	 * busy-poll and macOS's integrated-controller poll timer.
+	 */
+	if (r->ring_num != 0) {
+		r->rxpoll_active = true;
+		callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
+	    nhi_rxpoll_timer, r, C_PREL(2));
+		tb_debug(sc, DBG_INIT, "ring%d serviced by poll\n", r->ring_num);
+	}
+	return (0);
+}
+
+int
+nhi_ring_stop(struct nhi_ring_pair *r)
+{
+
+	if (r->priv_tracker) {
+		r->rxpoll_active = false;
+		callout_stop(&r->rxpoll_co);
+	}
+	return (nhi_deactivate_ring(r));
+}
+
+void
+nhi_ring_destroy(struct nhi_ring_pair *r)
+{
+
+	if (r->priv_tracker) {
+		r->rxpoll_active = false;	/* stop the callout re-arming */
+		callout_drain(&r->rxpoll_co);
+		free(r->tracker, M_NHI);
+		r->tracker = NULL;
+		r->priv_tracker = false;
+	}
+	SLIST_REMOVE(&r->sc->ring_list, r, nhi_ring_pair, ring_link);
+	if (r->cmds != NULL) {
+		free(r->cmds, M_NHI);
+		r->cmds = NULL;
+	}
+	if (r->frames != NULL) {
+		bus_dmamap_unload(r->frames_dmat, r->frames_map);
+		bus_dmamem_free(r->frames_dmat, r->frames, r->frames_map);
+		r->frames = NULL;
+	}
+	if (r->frames_dmat != NULL)
+		bus_dma_tag_destroy(r->frames_dmat);
+	nhi_free_ring(r);
+	/*
+	 * nhi_free_ring releases the ring's resources but not the ring_pair
+	 * itself, and we already removed it from ring_list above, so the
+	 * detach sweep (nhi_free_rings) can never reach it: free it here or
+	 * leak 32k per data ring on every disconnect (seen as "memory type
+	 * nhi leaked" at kldunload).
+	 */
+	free(r, M_NHI);
+}
+
 static int
 nhi_init(struct nhi_softc *sc)
 {
@@ -706,6 +1229,18 @@ nhi_post_init(void *arg)
 
 	sc = (struct nhi_softc *)arg;
 	tb_debug(sc, DBG_INIT | DBG_EXTRA, "nhi_post_init\n");
+	/*
+	 * Native USB4 (SW-CM) mode: kick the HCM router/adapter walk
+	 * (upstream never wires hcm_router_discover to any caller), then
+	 * bring up the XDomain responder + ThunderboltIP stack on top of the
+	 * attached root router.  tb_icm_init detects native mode from
+	 * sc->root_rsc and skips the ICM DRIVER_READY handshake.
+	 */
+	if (sc->hcm != NULL) {
+		hcm_router_discover(sc->hcm);
+		if (tb_icm_init(sc, sc->ring0, &sc->icm) != 0)
+			tb_printf(sc, "native XDomain/SW-CM init failed\n");
+	}
 
 	bzero(sc->lc_uuid, 16);
 	error = tb_config_get_lc_uuid(sc->root_rsc, sc->lc_uuid);
@@ -747,8 +1282,17 @@ nhi_tx_enqueue(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 	desc = &r->tx_ring[r->tx_pi].tx;
 	pi = (r->tx_pi + 1) & r->tx_ring_mask;
 	if (pi == r->tx_ci) {
+		/* Software-full: harvest hardware-completed slots first. */
 		mtx_unlock(&r->mtx);
-		return (EBUSY);
+		if (nhi_tx_harvest(r) == 0)
+			return (EBUSY);
+		mtx_lock(&r->mtx);
+		desc = &r->tx_ring[r->tx_pi].tx;
+		pi = (r->tx_pi + 1) & r->tx_ring_mask;
+		if (pi == r->tx_ci) {
+			mtx_unlock(&r->mtx);
+			return (EBUSY);
+		}
 	}
 	r->tx_cmd_ring[r->tx_pi] = cmd;
 	r->tx_pi = pi;
@@ -757,7 +1301,13 @@ nhi_tx_enqueue(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 	desc->addr_hi = htole32(cmd->data_busaddr >> 32);
 	desc->eof_len = htole16((cmd->pdf << TX_BUFFER_DESC_EOF_SHIFT) |
 	    cmd->req_len);
-	desc->flags_sof = cmd->pdf | TX_BUFFER_DESC_IE | TX_BUFFER_DESC_RS;
+	/*
+	 * SOF defaults to the EOF pdf (control ring 0: SOF == EOF == pdf), but a
+	 * FRAME-mode data frame needs a distinct SOF (ThunderboltIP sends
+	 * SOF=FRAME_START, EOF=FRAME_END; the peer's RX ring filters on both).
+	 */
+	desc->flags_sof = (cmd->sof != 0 ? cmd->sof : cmd->pdf) |
+	    TX_BUFFER_DESC_IE | TX_BUFFER_DESC_RS;
 	desc->offset = 0;
 	desc->payload_time = 0;
 
@@ -765,6 +1315,14 @@ nhi_tx_enqueue(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 	    "busaddr= 0x%jx\n", r->tx_pi, cmd->idx, cmd->req_len,
 	    cmd->data_busaddr);
 
+	/*
+	 * Doorbell must be a full 32-bit write: this NHI IGNORES sub-dword
+	 * MMIO (a 16-bit PI-only write was proven to never land - tx_pici
+	 * stayed 0 and the engine never transmitted).  The CI half is
+	 * hardware's field; writing our (possibly lagged) software tx_ci
+	 * into it has run every campaign to date without harm, so the
+	 * engine evidently latches only the PI half on writes.
+	 */
 	nhi_write_reg(sc, r->tx_pici_reg, pi << TX_RING_PI_SHIFT | r->tx_ci);
 	mtx_unlock(&r->mtx);
 	return (0);
@@ -781,7 +1339,8 @@ nhi_tx_schedule(struct nhi_ring_pair *r, struct nhi_cmd_frame *cmd)
 
 	error = nhi_tx_enqueue(r, cmd);
 	if (error == EBUSY)
-		nhi_write_reg(r->sc, r->tx_pici_reg, r->tx_pi << TX_RING_PI_SHIFT | r->tx_ci);
+		nhi_write_reg(r->sc, r->tx_pici_reg,
+		    r->tx_pi << TX_RING_PI_SHIFT | r->tx_ci);
 	return (error);
 }
 
@@ -995,24 +1554,17 @@ nhi_deregister_pdf(struct nhi_ring_pair *rp, struct nhi_dispatch *tx,
  * hardware touched.  This technique saves at least 2 MEMIO reads per
  * interrupt.
  */
-void
-nhi_intr(void *data)
+static void
+nhi_ring_process(struct nhi_ring_pair *r)
 {
 	union nhi_ring_desc *rxd;
 	struct nhi_cmd_frame *cmd;
-	struct nhi_intr_tracker *trkr = data;
-	struct nhi_softc *sc;
-	struct nhi_ring_pair *r;
+	struct nhi_softc *sc = r->sc;
 	struct nhi_tx_buffer_desc *txd;
+	struct nhi_rx_buffer_desc *hd;
+	struct nhi_cmd_frame *hcmd;
 	uint32_t val, old_ci;
 	u_int count;
-
-	sc = trkr->sc;
-
-	tb_debug(sc, DBG_INTR|DBG_FULL, "Interrupt @ vector %d\n",
-	    trkr->vector);
-	if ((r = trkr->ring) == NULL)
-		return;
 
 	/*
 	 * Process TX completions from the adapter.  Only go through
@@ -1020,27 +1572,53 @@ nhi_intr(void *data)
 	 */
 	count = r->tx_ring_depth;
 	while (count-- > 0) {
+		/*
+		 * Serialise the TX-completion consumer (tx_ci and
+		 * tx_cmd_ring[tx_ci]) with the TX submit path (nhi_tx_enqueue),
+		 * which mutates the same state under r->mtx.  This function runs
+		 * unlocked from the RX poll callout / ISR, so without the lock a
+		 * concurrent submit (e.g. the stream of TCP-ACK sends during a
+		 * bidirectional SMB transfer) can torn-read tx_cmd_ring and hand
+		 * nhi_tx_complete a garbage non-NULL pointer -> heap-address page
+		 * fault under sustained load.
+		 *
+		 * Two traps this ordering avoids:
+		 *  - Lock ONLY the index read+advance.  nhi_tx_complete ->
+		 *    nhi_free_tx_frame re-acquires r->mtx (non-recursive MTX_DEF),
+		 *    so completion must run with the lock dropped.
+		 *  - Never hold a ring lock across the RX loop below, which calls
+		 *    if_input(); the stack transmits synchronously in response
+		 *    (ARP/ACK) and re-enters nhi_tx_enqueue -> mtx_lock(&r->mtx).
+		 *    The RX loop is single-consumer (one callout per ring), so it
+		 *    needs no lock.
+		 */
+		mtx_lock(&r->mtx);
 		txd = &r->tx_ring[r->tx_ci].tx;
-		if ((txd->flags_sof & TX_BUFFER_DESC_DONE) == 0)
+		if ((txd->flags_sof & TX_BUFFER_DESC_DONE) == 0) {
+			mtx_unlock(&r->mtx);
 			break;
+		}
 		cmd = r->tx_cmd_ring[r->tx_ci];
 		tb_debug(sc, DBG_INTR|DBG_TXQ|DBG_FULL,
 		    "Found tx cmdidx= %d cmd= %p\n", r->tx_ci, cmd);
-
-		/* Pass the completion up the stack */
-		nhi_tx_complete(r, txd, cmd);
+		r->tx_ci = (r->tx_ci + 1) & r->tx_ring_mask;
+		mtx_unlock(&r->mtx);
 
 		/*
-		 * Advance to the next item in the ring via the cached
-		 * copy of the CI.  Clear the flags so we can detect
-		 * a new done condition the next time the ring wraps
-		 * around.  Anything higher up the stack that needs this
-		 * field should have already copied it.
-		 *
-		 * XXX is a memory barrier needed?
+		 * Pass the completion up the stack, unlocked.  cmd is NULL for a
+		 * TX slot we never submitted to (e.g. the RX ring's unused TX
+		 * side, which the poll still scans) - a stray/garbage DONE bit
+		 * there would otherwise deref a NULL cmd in nhi_tx_complete.
+		 */
+		if (cmd != NULL)
+			nhi_tx_complete(r, txd, cmd);
+
+		/*
+		 * Clear DONE only after nhi_tx_complete has read flags_sof.  Safe
+		 * unlocked: tx_ci has already advanced past this slot, which is
+		 * not reused until the ring wraps ~tx_ring_depth submits later.
 		 */
 		txd->flags_sof = 0;
-		r->tx_ci = (r->tx_ci + 1) & r->tx_ring_mask;
 	}
 
 	/* Process RX packets from the adapter */
@@ -1065,23 +1643,55 @@ nhi_intr(void *data)
 		/*
 		 * Pass the RX frame up the stack.  RX frames are re-used
 		 * in-place, so their contents must be copied before this
-		 * function returns.
+		 * function returns.  Guard against a NULL cmd (unbacked slot /
+		 * stale index): nhi_rx_complete dereferences cmd immediately.
 		 *
 		 * XXX Rings other than Ring0 might want to have a different
 		 * re-use and re-populate policy
 		 */
-		nhi_rx_complete(r, &rxd->rxpost, cmd);
+		if (cmd != NULL)
+			nhi_rx_complete(r, &rxd->rxpost, cmd);
 
 		/*
-		 * Advance the CI and move forward to the next item in the
-		 * ring via our cached copy of the PI.  Clear out the
-		 * length field so we can detect a new RX frame when the
-		 * ring wraps around.  Reset the flags of the descriptor.
+		 * Clear the consumed slot's length so we can detect a new frame
+		 * when the ring wraps, then re-post an empty buffer.
 		 */
 		rxd->rxpost.eof_len = 0;
-		rxd->rx.flags = RX_BUFFER_DESC_RS | RX_BUFFER_DESC_IE;
+		if (r->frame_mode) {
+			/*
+			 * FRAME-mode data ring: re-post at HEAD (rx_ci), one
+			 * slot behind the tail (rx_pi) just consumed, so exactly
+			 * one hole rolls forward.  Ring 0's in-place re-post
+			 * (else branch) leaves no hole, and the fabric fill
+			 * pointer stalls after one ring's worth - "RX goes deaf"
+			 * (the standalone driver's hard-won rule).  The buffer
+			 * address survives the HW fill (it overwrites only the
+			 * eof_len/flags at offset >=8), but re-set it defensively.
+			 */
+			hd = &r->rx_ring[r->rx_ci].rx;
+			hcmd = r->rx_cmd_ring[r->rx_ci];
+			if (hcmd != NULL) {
+				hd->addr_lo = hcmd->data_busaddr & 0xffffffff;
+				hd->addr_hi =
+				    (hcmd->data_busaddr >> 32) & 0xffffffff;
+				hd->offset = 0;
+				hd->flags = RX_BUFFER_DESC_RS |
+				    RX_BUFFER_DESC_IE;
+			}
+		} else {
+			rxd->rx.flags = RX_BUFFER_DESC_RS | RX_BUFFER_DESC_IE;
+		}
 		r->rx_ci = (r->rx_ci + 1) & r->rx_ring_mask;
 		r->rx_pi = (r->rx_pi + 1) & r->rx_ring_mask;
+		/*
+		 * FRAME-mode: return the E2E credit for every consumed frame
+		 * immediately (standalone's per-frame doorbell, #69) - a
+		 * once-per-drain-batch CI write bounds the producer to poll
+		 * cadence and starves the peer's fully-E2E transmitter.
+		 */
+		if (r->frame_mode)
+			nhi_write_reg(sc, r->rx_pici_reg,
+			    r->rx_ci & RX_RING_CI_MASK);
 	}
 
 	/*
@@ -1093,11 +1703,102 @@ nhi_intr(void *data)
 	 * interrupt?
 	 */
 	if (r->rx_ci != old_ci) {
-		val = r->rx_pi << RX_RING_PI_SHIFT | r->rx_ci;
-		tb_debug(sc, DBG_INTR | DBG_RXQ,
-		    "Writing new RX PICI= 0x%08x\n", val);
-		nhi_write_reg(sc, r->rx_pici_reg, val);
+		/*
+		 * FRAME-mode data ring: advertise only HEAD (rx_ci) in the CI
+		 * field, matching the proven data-ring path.  Writing the
+		 * consumer (rx_pi) into the PI field can gate the fabric
+		 * producer to the tail and starve RX credits.  Ring 0 keeps the
+		 * combined PI|CI write it was validated with.
+		 */
+		/*
+		 * 32-bit only - this NHI ignores sub-dword MMIO writes (see
+		 * the TX doorbell).  FRAME-mode rings already returned their
+		 * credits per-frame inside the loop; this batch-end write is
+		 * ring 0's validated combined form.
+		 */
+		if (!r->frame_mode) {
+			val = r->rx_pi << RX_RING_PI_SHIFT | r->rx_ci;
+			tb_debug(sc, DBG_INTR | DBG_RXQ,
+			    "Writing new RX PICI= 0x%08x\n", val);
+			nhi_write_reg(sc, r->rx_pici_reg, val);
+		}
 	}
+
+	/*
+	 * NAPI-style batch end: after draining the whole RX ring, let the
+	 * client flush a coalesced delivery (LRO) in one shot.  Runs in the
+	 * same (unlocked) context as the per-frame rx callbacks above, so it
+	 * may call into the stack.  Only when we actually consumed frames.
+	 */
+	if (r->rx_batch_cb != NULL && r->rx_ci != old_ci)
+		r->rx_batch_cb(r->rx_batch_ctx);
+}
+
+/*
+ * Poll a vector-less ring by draining it on a callout (see
+ * nhi_ring_pair.rxpoll_co).  Runs only for rings whose number is >= msix_count
+ * - those have no MSI-X vector, so this never races the interrupt path.  This
+ * is the RX path when MSI-X allocation gives too few vectors (Meteor Lake),
+ * matching the standalone driver's poll loop and macOS's poll timer.
+ */
+static void
+nhi_rxpoll_timer(void *arg)
+{
+	struct nhi_ring_pair *r = arg;
+
+	if (!r->rxpoll_active)
+		return;
+	if (nhi_dead(r->sc)) {
+		/* Controller vanished (mode switch/unplug): stop polling. */
+		r->rxpoll_active = false;
+		return;
+	}
+	nhi_ring_process(r);
+	callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
+	    nhi_rxpoll_timer, r, C_PREL(2));
+}
+
+/*
+ * One manual drain of a ring, for a blocked waiter probing whether its
+ * ring's interrupt path is alive (tb_icm_request).  Caller must ensure no
+ * concurrent servicing: only call when the ring's ISR has demonstrably not
+ * fired (waiter timed out) or after nhi_ring_force_poll.
+ */
+void
+nhi_ring_poll(struct nhi_ring_pair *r)
+{
+	nhi_ring_process(r);
+}
+
+/*
+ * Permanently switch a ring from interrupt servicing to the data-ring poll
+ * (#26: MTL NHIs have lost per-ring vector delivery before; Apple's own
+ * integrated HAL falls back to a poll timer).  Detach the ring from its
+ * MSI-X tracker first so a late ISR cannot race the callout, both run
+ * nhi_ring_process unserialized on the RX side.
+ */
+void
+nhi_ring_force_poll(struct nhi_ring_pair *r)
+{
+	if (r->rxpoll_active)
+		return;
+	if (r->tracker != NULL)
+		r->tracker->ring = NULL;
+	r->rxpoll_active = true;
+	callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
+	    nhi_rxpoll_timer, r, C_PREL(2));
+}
+
+void
+nhi_intr(void *data)
+{
+	struct nhi_intr_tracker *trkr = data;
+	struct nhi_ring_pair *r;
+
+	tb_debug(trkr->sc, DBG_INTR|DBG_FULL, "Interrupt @ vector %d\n",
+	    trkr->vector);
+	if ((r = trkr->ring) != NULL)
+		nhi_ring_process(r);
 }
 
 static int

@@ -47,6 +47,7 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
+#include <machine/atomic.h>
 #include <machine/bus.h>
 #include <machine/stdarg.h>
 
@@ -59,7 +60,45 @@
 #include <dev/thunderbolt/router_var.h>
 #include <dev/thunderbolt/hcm_var.h>
 
+#include <dev/thunderbolt/tb_icm.h>
+
 static void hcm_cfg_task(void *, int);
+static void hcm_link_task(void *, int);
+
+/*
+ * TB3 (Titan/Alpine Ridge) plug-event arming.  Unlike a USB4 router, a TB3
+ * router keeps its ADAPTER config space unreachable and emits NO hotplug
+ * notifications until plug-event delivery is armed on the switch - so the
+ * adapter walk below times out on every read and a cabled peer is never
+ * noticed.
+ *
+ * The exact write was captured by dtrace of IOThunderboltSwitchType3::
+ * enablePlugEvents on the real Titan Ridge (2018 MBP, macOS 15.7): it issues
+ * IOThunderboltController::configModifyDWordWithMask(space=2 ROUTER, port=0,
+ * offset=0x3c, mask=0x04000000, data=0x04000000) on the root switch - a RMW
+ * setting bit 26 at ROUTER config-space offset 0x3c.  Every one of the 13
+ * arm writes seen in a plug capture was byte-identical; there is no per-port
+ * variant.  (An earlier static RE mistook the LC-cap signature 0x10500/mask
+ * 0xffff00 for the arm value; the live trace corrected it.)  USB4 SwitchOS
+ * has no equivalent.  Do this before the adapter walk, TB3 only.
+ */
+static void
+hcm_tb3_enable_lc(struct hcm_softc *hcm)
+{
+	struct router_softc *rsc = hcm->nsc->root_rsc;
+	uint32_t v;
+	int error;
+
+	if ((error = tb_config_router_read(rsc, 0x3c, 1, &v)) != 0) {
+		tb_printf(hcm, "TB3: plug-event arm read failed (%d); adapter "
+		    "config + hotplug will stay dead\n", error);
+		return;
+	}
+	v |= 0x04000000u;			/* bit 26 */
+	error = tb_config_router_write(rsc, 0x3c, 1, &v);
+	tb_printf(hcm, "TB3: plug events armed - router[0x3c] |= bit26 (%d)\n",
+	    error);
+}
 
 int
 hcm_attach(struct nhi_softc *nsc)
@@ -76,6 +115,7 @@ hcm_attach(struct nhi_softc *nsc)
 
 	hcm->dev = nsc->dev;
 	hcm->nsc = nsc;
+	hcm->debug = nsc->debug;
 	nsc->hcm = hcm;
 
 	hcm->taskqueue = taskqueue_create("hcm_event", M_NOWAIT,
@@ -85,8 +125,59 @@ hcm_attach(struct nhi_softc *nsc)
 	taskqueue_start_threads(&hcm->taskqueue, 1, PI_DISK, "tbhcm%d_tq",
 	    device_get_unit(nsc->dev));
 	TASK_INIT(&hcm->cfg_task, 0, hcm_cfg_task, hcm);
+	TASK_INIT(&hcm->link_task, 0, hcm_link_task, hcm);
 
 	return (0);
+}
+
+/*
+ * Serialized link-event entry point.  Hot plug/unplug interrupts (and any
+ * future link events) funnel through here onto the single HCM taskqueue -
+ * Apple's "one configuration thread" model.  Interrupt-safe; events coalesce
+ * via the pending flags (a dual-lane plug raises two interrupts).
+ */
+void
+hcm_link_event(struct hcm_softc *hcm, u_int port, bool unplug)
+{
+	if (hcm == NULL)
+		return;
+	if (unplug)
+		atomic_store_rel_int(&hcm->unplug_pending, 1);
+	else
+		atomic_store_rel_int(&hcm->plug_pending, 1);
+	taskqueue_enqueue(hcm->taskqueue, &hcm->link_task);
+}
+
+static void
+hcm_link_task(void *arg, int pending __unused)
+{
+	struct hcm_softc *hcm = arg;
+	struct nhi_softc *nsc = hcm->nsc;
+	int plug, unplug;
+
+	/* Atomic take: a plain read+clear loses an event that lands in the
+	 * window between them (interrupt on another CPU). */
+	unplug = atomic_readandclear_int(&hcm->unplug_pending);
+	plug = atomic_readandclear_int(&hcm->plug_pending);
+
+	if (nhi_dead(nsc)) {
+		/* Controller vanished (e.g. TB->USB mode renegotiation):
+		 * tear the session down cleanly and stop touching hardware. */
+		tb_printf(hcm, "NHI missing - tearing down session\n");
+		tb_icm_link_down(nsc->icm);
+		return;
+	}
+
+	if (unplug)
+		tb_icm_link_down(nsc->icm);
+
+	if (plug) {
+		/* Debounce: a plug raises per-lane events back to back; let
+		 * the link settle, then unlock/configure and nudge the peer. */
+		pause("tbdeb", hz / 2);
+		hcm_cfg_task(hcm, 0);
+		tb_icm_link_up_hint(nsc->icm);
+	}
 }
 
 int
@@ -94,9 +185,17 @@ hcm_detach(struct nhi_softc *nsc)
 {
 	struct hcm_softc *hcm;
 
+	/*
+	 * On an ICM-mode controller (or after a failed hcm_attach) the HCM
+	 * was never allocated - detach is still called for the NHI.
+	 */
 	hcm = nsc->hcm;
+	if (hcm == NULL)
+		return (0);
 	if (hcm->taskqueue)
 		taskqueue_free(hcm->taskqueue);
+	nsc->hcm = NULL;
+	free(hcm, M_THUNDERBOLT);
 
 	return (0);
 }
@@ -175,6 +274,11 @@ hcm_cfg_task(void *arg, int pending)
 	} else
 		tb_printf(hcm, "Error finding LC registers: %d\n", error);
 
+	/* TB3: bring up the Link Controller so adapter config space responds
+	 * and hotplug notifications fire (USB4 needs none of this). */
+	if ((hcm->nsc->quirks & NHI_QUIRK_TB3) != 0)
+		hcm_tb3_enable_lc(hcm);
+
 	for (i = 1; i <= rsc->max_adap; i++) {
 		error = tb_config_adapter_read(rsc, i, 0, 8, buf);
 		if (error != 0) {
@@ -189,6 +293,34 @@ hcm_cfg_task(void *arg, int pending)
 
 		if (GET_ADP_CS_TYPE(adp) != ADP_CS2_LANE)
 			continue;
+
+		/*
+		 * Native-CM duties the ICM used to do:
+		 * 1. hot-plugged adapters come up LOCKED (ADP_CS_4.LCK,
+		 *    bit 31 - Linux usb4_port_unlock) and reject all transit
+		 *    with "Adapter locked" error notifications;
+		 * 2. the USB4 port must be marked inter-domain configured
+		 *    (PORT_CS_19.PID, bit 4, at the USB4 port capability,
+		 *    cap id 6 - Linux usb4_port_configure_xdomain) for a
+		 *    host-to-host link.
+		 */
+		error = tb_config_adapter_read(rsc, i, 4, 1, buf);
+		if (error == 0 && (buf[0] & (1u << 31)) != 0) {
+			buf[0] &= ~(1u << 31);
+			error = tb_config_write(rsc, TB_CFG_CS_ADAPTER, i, 4,
+			    1, buf);
+			tb_printf(hcm, "unlocked lane adapter %d (%d)\n", i,
+			    error);
+		}
+		if (tb_config_find_adapter_cap(rsc, i, 6, &offset) == 0 &&
+		    tb_config_adapter_read(rsc, i, offset + 0x13, 1,
+		    buf) == 0 && (buf[0] & (1u << 4)) == 0) {
+			buf[0] |= (1u << 4);
+			error = tb_config_write(rsc, TB_CFG_CS_ADAPTER, i,
+			    offset + 0x13, 1, buf);
+			tb_printf(hcm, "adapter %d: inter-domain (PID) set "
+			    "(%d)\n", i, error);
+		}
 
 		error = tb_config_find_adapter_cap(rsc, i, TB_CFG_CAP_LANE,
 		    &offset);
@@ -212,10 +344,12 @@ hcm_cfg_task(void *arg, int pending)
 			newr.hi = rsc->route.hi;
 			newr.lo = rsc->route.lo | (i << rsc->depth * 8);
 
-			tb_printf(hcm, "want to add router at 0x%08x%08x\n",
+			tb_debug(hcm, DBG_HCM, "want to add router at 0x%08x%08x\n",
 			    newr.hi, newr.lo);
 			error = tb_router_attach(rsc, newr);
-			tb_printf(rsc, "tb_router_attach returned %d\n", error);
+			if (error != 0)
+				tb_printf(rsc, "tb_router_attach failed: %d\n",
+				    error);
 		}
 	}
 
