@@ -63,6 +63,13 @@
 #define	NHI_TBNET_PRTCVERS	1
 #define	NHI_TBNET_PRTCREVS	1
 #define	NHI_TBNET_PRTCSTNS	(0x1 | 0x2 | 0x4)	/* E2E|MATCH_FRAGS_ID|64K */
+/* #81: advertise an RDMA-over-TB service so an RDMA-enabled Apple peer's
+ * AppleThunderboltRDMAPeerInterface (IOPropertyMatch Protocol ID=64087) probes
+ * us.  Values from the live M5 Max advert (Plane #79/#80). */
+#define	NHI_TBRDMA_PRTCID	64087	/* 0xFA57 */
+#define	NHI_TBRDMA_PRTCVERS	1
+#define	NHI_TBRDMA_PRTCREVS	0
+#define	NHI_TBRDMA_PRTCSTNS	0
 #define	NHI_NET_DIR_UUID { 0xc6,0x61,0x89,0xca, 0x1c,0xce, 0x41,0x95, \
 			   0xbd,0xb8, 0x49,0x59,0x2e,0x5f,0x5a,0x4f }
 #define	NHI_TBIP_SVC_UUID { 0x79,0x8f,0x58,0x9e, 0x36,0x16, 0x8a,0x47, \
@@ -163,6 +170,27 @@ xdp_put_entry(uint32_t *b, u_int e, const char *key, u_int length, u_int type,
 	b[e + 3] = value;
 }
 
+/*
+ * Like xdp_put_entry but the 8-byte directory key is given as raw bytes, not a
+ * C string.  Apple's AppleThunderboltRDMAPeerInterface::probe requires the RDMA
+ * service directory's *key* (which the Mac exposes as the "Service Key"
+ * property) to byte-match a fixed 8-byte constant that contains 0xFF and no NUL
+ * terminator, so xdp_put_entry (strlen-based) cannot emit it.  Keys are packed
+ * big-endian, same as xdp_word, and the block is transmitted big-endian, so the
+ * two key dwords land on the wire as key[0..7] in order.
+ */
+static void
+xdp_put_entry_rawkey(uint32_t *b, u_int e, const uint8_t key[8], u_int length,
+    u_int type, uint32_t value)
+{
+	b[e + 0] = ((uint32_t)key[0] << 24) | ((uint32_t)key[1] << 16) |
+	    ((uint32_t)key[2] << 8) | (uint32_t)key[3];
+	b[e + 1] = ((uint32_t)key[4] << 24) | ((uint32_t)key[5] << 16) |
+	    ((uint32_t)key[6] << 8) | (uint32_t)key[7];
+	b[e + 2] = (uint32_t)(length & 0xffff) | ((uint32_t)type << 24);
+	b[e + 3] = value;
+}
+
 static void
 xdp_put_text(uint32_t *b, u_int off, const char *s)
 {
@@ -176,10 +204,18 @@ static void
 tb_xdomain_build_dir(struct tb_xdomain *xd)
 {
 	static const uint8_t net_uuid[16] = NHI_NET_DIR_UUID;
+	/* Locally-administered RDMA service instance UUID (peers match on prtcid
+	 * 0xFA57, not this; the instance uuid is per-node like the network one). */
+	static const uint8_t rdma_uuid[16] = {
+	    0xfb, 0xf5, 0x0e, 0x03, 0x5d, 0x6a, 0x48, 0x62,
+	    0x90, 0x82, 0xaa, 0xdd, 0xf6, 0x40, 0xcc, 0x6a };
+	/* RDMA service directory key that Apple's RDMA probe() demands (see below). */
+	static const uint8_t rdma_svc_key[8] = {
+	    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x41, 0x44 };
 	uint32_t *b = xd->prop_block;
 	static const char vname[] = "FreeBSD";
 	char host[24];
-	u_int e, fb_off, hn_off, net_off, fb_dw, hn_dw, net_len, total;
+	u_int e, fb_off, hn_off, net_off, rdma_off, fb_dw, hn_dw, svc_len, total;
 
 	getcredhostname(curthread->td_ucred, host, sizeof(host));
 	if (host[0] == '\0')
@@ -187,12 +223,14 @@ tb_xdomain_build_dir(struct tb_xdomain *xd)
 
 	fb_dw = howmany(strlen(vname) + 1, 4);
 	hn_dw = howmany(strlen(host) + 1, 4);
-	net_len = 4 + 4 * 4;
+	svc_len = 4 + 4 * 4;			/* uuid(4) + 4 prtc entries   */
 
-	fb_off = 30;
+	/* Root dir now has 8 entries (2..33), so text starts at dword 34. */
+	fb_off = 34;
 	hn_off = fb_off + fb_dw;
 	net_off = hn_off + hn_dw;
-	total = net_off + net_len;
+	rdma_off = net_off + svc_len;
+	total = rdma_off + svc_len;
 
 	bzero(b, sizeof(xd->prop_block));
 	b[0] = NHI_PROP_MAGIC;
@@ -205,7 +243,20 @@ tb_xdomain_build_dir(struct tb_xdomain *xd)
 	xdp_put_entry(b, e, "maxhopid", 1, NHI_PROP_TYPE_VALUE, 0x8); e += 4;
 	xdp_put_entry(b, e, "vendorid", fb_dw, NHI_PROP_TYPE_TEXT, fb_off); e += 4;
 	xdp_put_entry(b, e, "deviceid", hn_dw, NHI_PROP_TYPE_TEXT, hn_off); e += 4;
-	xdp_put_entry(b, e, "network", net_len, NHI_PROP_TYPE_DIRECTORY, net_off);
+	xdp_put_entry(b, e, "network", svc_len, NHI_PROP_TYPE_DIRECTORY, net_off); e += 4;
+	/*
+	 * The RDMA service directory's key is NOT "rdma": Apple's
+	 * AppleThunderboltRDMAPeerInterface::probe byte-compares the peer's
+	 * "Service Key" (= this directory key) against the fixed 8-byte constant
+	 * ff ff ff ff ff ff 41 44 ("......AD"), and rejects any mismatch
+	 * ("service key failed to match at index N").  A real macOS RDMA peer
+	 * advertises exactly these bytes; using "rdma" here fails probe at index
+	 * 0 so the Mac never binds its RDMA PeerInterface (port stays DOWN,
+	 * alloc_pd is refused).  prtcid=0xFA57 / prtcvers=1 in the subdir still
+	 * satisfy the IOPropertyMatch (Protocol ID/Version) that gates probe.
+	 */
+	xdp_put_entry_rawkey(b, e, rdma_svc_key, svc_len, NHI_PROP_TYPE_DIRECTORY,
+	    rdma_off);
 
 	xdp_put_text(b, fb_off, vname);
 	xdp_put_text(b, hn_off, host);
@@ -217,11 +268,18 @@ tb_xdomain_build_dir(struct tb_xdomain *xd)
 	xdp_put_entry(b, e, "prtcrevs", 1, NHI_PROP_TYPE_VALUE, NHI_TBNET_PRTCREVS); e += 4;
 	xdp_put_entry(b, e, "prtcstns", 1, NHI_PROP_TYPE_VALUE, NHI_TBNET_PRTCSTNS);
 
+	memcpy(&b[rdma_off], rdma_uuid, sizeof(rdma_uuid));
+	e = rdma_off + 4;
+	xdp_put_entry(b, e, "prtcid", 1, NHI_PROP_TYPE_VALUE, NHI_TBRDMA_PRTCID); e += 4;
+	xdp_put_entry(b, e, "prtcvers", 1, NHI_PROP_TYPE_VALUE, NHI_TBRDMA_PRTCVERS); e += 4;
+	xdp_put_entry(b, e, "prtcrevs", 1, NHI_PROP_TYPE_VALUE, NHI_TBRDMA_PRTCREVS); e += 4;
+	xdp_put_entry(b, e, "prtcstns", 1, NHI_PROP_TYPE_VALUE, NHI_TBRDMA_PRTCSTNS);
+
 	xd->prop_dwords = total;
 	xd->prop_generation = 1;
 	device_printf(xd->nsc->dev,
-	    "xdomain: property dir built (%u dwords, host=\"%s\", +network svc)\n",
-	    total, host);
+	    "xdomain: property dir built (%u dwords, host=\"%s\", +network +rdma "
+	    "(0xFA57) svc)\n", total, host);
 }
 
 static void
@@ -269,6 +327,28 @@ xdp_props_response(struct tb_xdomain *xd, uint8_t *r, uint32_t rhi, uint32_t rlo
 	for (i = 0; i < chunk; i++)
 		le32enc(r + 72 + i * 4, xd->prop_block[off + i]);
 	return (total);
+}
+
+/*
+ * #80 diagnostic: actively request the PEER's property directory and report the
+ * services it advertises (we are normally the responder and never read the
+ * peer's dir).  Used to observe an Apple peer's RDMA service (prtcid 0xFA57).
+ */
+static void
+tb_xdp_request_peer_props(struct tb_xdomain *xd, u_int off)
+{
+	uint8_t r[72];
+	u_int total = 68;
+
+	if (!xd->has_peer)
+		return;
+	bzero(r, total);
+	xdp_hdr(r, xd->peer_route_hi, xd->peer_route_lo, 0, total,
+	    NHI_XDP_PROPERTIES_REQUEST);
+	memcpy(r + 32, xd->local_uuid, 16);	/* src = us */
+	memcpy(r + 48, xd->peer_uuid, 16);	/* dst = the peer */
+	le32enc(r + 64, off & 0xffff);
+	tb_xdp_ctl_tx(xd, PDF_XDOMAIN_REQ, r, total);
 }
 
 /* ---- dispatch (verbatim from nhi_xdomain_handle) ------------------------- */
@@ -327,6 +407,9 @@ tb_xdp_dispatch(struct tb_xdomain *xd, const uint8_t *f, u_int len)
 			if (xd->peer_cb != NULL)
 				xd->peer_cb(xd->peer_ctx, xd->peer_uuid,
 				    xd->local_uuid, rhi, rlo);
+			/* #80: reciprocally ask the peer for ITS dir so we can
+			 * see what services it advertises (RDMA prtcid 0xFA57). */
+			tb_xdp_request_peer_props(xd, 0);
 		}
 		off = le32dec(f + 64) & 0xffff;
 		rlen = xdp_props_response(xd, r, rhi, rlo, length_sn, f + 32, off);
@@ -334,6 +417,38 @@ tb_xdp_dispatch(struct tb_xdomain *xd, const uint8_t *f, u_int len)
 		tb_debug(xd->nsc, DBG_INIT,
 		    "xdomain: PROPERTIES_REQUEST off=%u -> %u bytes\n", off, rlen);
 		break;
+	case NHI_XDP_PROPERTIES_RESPONSE: {
+		/* #80: the peer answered our reciprocal props request.  Dump the
+		 * chunk and flag any RDMA service (prtcid 0xFA57 = 64087). */
+		u_int poff, ptot, ndw, i;
+
+		if (len < 72)
+			break;
+		poff = le32dec(f + 64) & 0xffff;
+		ptot = (le32dec(f + 64) >> 16) & 0xffff;
+		ndw = (len - 72) / 4;
+		device_printf(xd->nsc->dev,
+		    "xdomain: PEER PROPS off=%u total=%u chunk=%u dw\n",
+		    poff, ptot, ndw);
+		for (i = 0; i < ndw; i++) {
+			uint32_t v = le32dec(f + 72 + i * 4);
+			if (v == 64087)
+				device_printf(xd->nsc->dev, "xdomain: >>> PEER "
+				    "advertises RDMA prtcid=0x%x (0xFA57) @dw %u "
+				    "<<<\n", v, poff + i);
+		}
+		/* compact hex of the block for offline UUID decode */
+		for (i = 0; i < ndw; i += 4)
+			device_printf(xd->nsc->dev, "xdprop[%3u] %08x %08x "
+			    "%08x %08x\n", poff + i, le32dec(f + 72 + i * 4),
+			    (i + 1 < ndw) ? le32dec(f + 72 + (i + 1) * 4) : 0,
+			    (i + 2 < ndw) ? le32dec(f + 72 + (i + 2) * 4) : 0,
+			    (i + 3 < ndw) ? le32dec(f + 72 + (i + 3) * 4) : 0);
+		/* more chunks?  fetch the next. */
+		if (poff + ndw < ptot)
+			tb_xdp_request_peer_props(xd, poff + ndw);
+		break;
+	}
 	case NHI_XDP_PROPERTIES_CHANGED_REQUEST:
 		xdp_hdr(r, rhi, rlo, length_sn, XDP_HDR_LEN,
 		    NHI_XDP_PROPERTIES_CHANGED_RESPONSE);
