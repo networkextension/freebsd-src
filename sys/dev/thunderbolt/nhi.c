@@ -60,6 +60,7 @@
 #include <dev/thunderbolt/router_var.h>
 #include <dev/thunderbolt/tb_dev.h>
 #include <dev/thunderbolt/tb_icm.h>
+#include <dev/thunderbolt/tb_rdma_if.h>
 #include <dev/pci/pcivar.h>
 #include "tb_if.h"
 
@@ -477,6 +478,9 @@ nhi_detach(struct nhi_softc *sc)
 	 * the HCM used to dereference the NULL sc->hcm (kldunload panic,
 	 * hcm_detach+0x4).
 	 */
+	/* Withdraw from the RDMA provider before the controller goes away. */
+	tb_rdma_controller_gone(sc);
+
 	/* hcm first: its taskqueue's link task dereferences sc->icm. */
 	hcm_detach(sc);
 	if (sc->icm != NULL) {
@@ -1258,6 +1262,13 @@ nhi_post_init(void *arg)
 	    "%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
 	    u[15], u[14], u[13], u[12], u[11], u[10], u[9], u[8], u[7],
 	    u[6], u[5], u[4], u[3], u[2], u[1], u[0]);
+
+	/*
+	 * Controller is fully up (root router attached, UUID known): offer it
+	 * to the RDMA provider (tbrdma.ko) if one is loaded.  No-op link when
+	 * tbrdma is absent - the shim lives in this module.
+	 */
+	tb_rdma_controller_ready(sc);
 
 	config_intrhook_disestablish(&sc->ich);
 }

@@ -263,6 +263,7 @@ SUBDIR=	\
 	${_mlx4} \
 	${_mlx4ib} \
 	${_mlx4en} \
+	${_tbrdma} \
 	${_mlx5} \
 	${_mlx5en} \
 	${_mlx5ib} \
@@ -588,6 +589,7 @@ _mlx5en=	mlx5en
 .if ${MK_OFED} != "no" || defined(ALL_MODULES)
 _mlx4ib=	mlx4ib
 _mlx5ib=	mlx5ib
+_tbrdma=	tbrdma
 .endif
 .endif
 

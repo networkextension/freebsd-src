@@ -53,6 +53,7 @@
 #include <dev/thunderbolt/tb_xdomain.h>
 #include <dev/thunderbolt/if_tbt.h>
 #include <dev/thunderbolt/tb_icm.h>
+#include <dev/thunderbolt/tb_rdma_if.h>
 
 /* ICM protocol (firmware connection manager); not in the in-tree headers. */
 #define	ICM_DRIVER_READY		0x03
@@ -131,6 +132,32 @@ struct tb_icm {
 
 static void tb_icm_login_timer(void *);
 static void tbip_send_logout(struct tb_icm *);
+
+/*
+ * Peer/session snapshot for the RDMA provider (tbrdma.ko).  Reads the live
+ * session fields under the icm lock; returns 0 only when a peer is present.
+ */
+int
+tb_icm_get_peer(struct tb_icm *icm, struct tb_rdma_peer *out)
+{
+	if (icm == NULL)
+		return (ENXIO);
+
+	mtx_lock(&icm->lock);
+	out->has_peer = icm->has_peer;
+	out->paths_approved = icm->paths_approved;
+	out->route_hi = icm->peer_route_hi;
+	out->route_lo = icm->peer_route_lo;
+	out->lane = icm->peer_route_lo & 0x3f;
+	if (out->lane == 0)
+		out->lane = 1;
+	out->local_tx_hopid = icm->local_tx_hopid;
+	out->remote_tx_hopid = icm->remote_tx_hopid;
+	memcpy(out->peer_uuid, icm->peer_uuid, 16);
+	mtx_unlock(&icm->lock);
+
+	return (icm->has_peer ? 0 : ENOTCONN);
+}
 
 /* ---- ring-0 control frame wire I/O (native <-> big-endian dword + CRC) ---- */
 
