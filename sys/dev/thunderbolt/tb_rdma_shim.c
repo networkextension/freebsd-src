@@ -22,6 +22,7 @@
 #include <sys/sx.h>
 #include <sys/queue.h>
 #include <sys/module.h>
+#include <sys/callout.h>
 #include <sys/bus.h>
 #include <sys/rman.h>
 #include <machine/bus.h>
@@ -264,6 +265,39 @@ tb_rdma_read_hop(struct tb_rdma_dev *tbd, uint8_t adap, u_int hopid,
 	if (rsc == NULL)
 		return (ENXIO);
 	return (tb_config_path_read(rsc, adap, hopid, 1, out));
+}
+
+void
+tb_rdma_ring_set_userspace(struct tb_rdma_ring *ring)
+{
+	struct nhi_ring_pair *r = (struct nhi_ring_pair *)ring;
+
+	/* Kill the kernel RX poll callout: userspace owns this ring now. */
+	callout_drain(&r->rxpoll_co);
+	r->rxpoll_active = false;
+}
+
+void
+tb_rdma_ring_mmap_info(struct tb_rdma_ring *ring, struct tb_rdma_ring_mem *out)
+{
+	struct nhi_ring_pair *r = (struct nhi_ring_pair *)ring;
+
+	out->desc_phys = r->tx_ring_busaddr;
+	out->desc_size = 16u * (r->tx_ring_depth + r->rx_ring_depth);
+	out->frames_phys = r->rx_frames_busaddr;
+	out->frames_size = (uint32_t)(r->tx_ring_depth + r->rx_ring_depth) *
+	    r->rx_buffer_size;
+	out->tx_depth = r->tx_ring_depth;
+	out->rx_depth = r->rx_ring_depth;
+	out->frame_size = r->rx_buffer_size;
+	out->ring_num = r->ring_num;
+}
+
+void
+tb_rdma_doorbell_bar(struct tb_rdma_dev *tbd, uint64_t *bar_pa, uint32_t *size)
+{
+	*bar_pa = rman_get_start(tbd->sc->regs_resource);
+	*size = 0x9000;		/* covers TX 0x8+N*16 and RX 0x8008+N*16, N<32 */
 }
 
 /*

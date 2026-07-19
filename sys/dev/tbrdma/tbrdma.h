@@ -44,6 +44,16 @@
 #define	TBRDMA_HOP_CREDITS	14
 #define	TBRDMA_NHI_PORT_ADAP	7	/* NHI adapter port (== TB_RDMA_NHI_PORT) */
 
+/*
+ * mmap() offset selectors (as page indices, i.e. vma->vm_pgoff): userspace
+ * mmaps each region of its QP at these fixed offsets on the uverbs fd.
+ */
+#define	TBRDMA_MMAP_DOORBELL	0	/* BAR0 doorbell window (io) */
+#define	TBRDMA_MMAP_TX_DESC	1	/* TX ring descriptor memory */
+#define	TBRDMA_MMAP_TX_FRAMES	2	/* TX ring frame pool */
+#define	TBRDMA_MMAP_RX_DESC	3	/* RX ring descriptor memory */
+#define	TBRDMA_MMAP_RX_FRAMES	4	/* RX ring frame pool */
+
 struct tbrdma_dev {
 	struct ib_device	ib_dev;		/* MUST be first */
 	struct tb_rdma_dev	*tbd;		/* opaque native handle */
@@ -54,6 +64,15 @@ struct tbrdma_dev {
 
 struct tbrdma_cq {
 	struct ib_cq		ibcq;		/* MUST be first */
+};
+
+struct tbrdma_mr {
+	struct ib_mr		ibmr;		/* MUST be first */
+	struct vm_page		**pages;	/* held user pages */
+	int			npages;
+	u64			dma_base;	/* NHI bus address of MR start */
+	u32			region_id;	/* compact handle (== lkey/rkey) */
+	size_t			length;
 };
 
 struct tbrdma_qp {
@@ -69,6 +88,7 @@ struct tbrdma_qp {
 	u32			dest_qpn;	/* remote QPN */
 	u8			dgid[16];	/* remote GID */
 	enum ib_qp_state	state;
+	bool			userspace;	/* rings handed to userspace */
 	bool			rx_hop_done;
 	bool			tx_hop_done;
 	bool			rx_started;
@@ -77,6 +97,7 @@ struct tbrdma_qp {
 
 struct tbrdma_ucontext {
 	struct ib_ucontext	ibucontext;	/* MUST be first */
+	struct tbrdma_qp	*qp;		/* userspace QP for mmap lookup */
 };
 
 struct tbrdma_pd {
@@ -113,6 +134,12 @@ to_tqp(struct ib_qp *ibqp)
 	return container_of(ibqp, struct tbrdma_qp, ibqp);
 }
 
+static inline struct tbrdma_mr *
+to_tmr(struct ib_mr *ibmr)
+{
+	return container_of(ibmr, struct tbrdma_mr, ibmr);
+}
+
 /*
  * Internal QP engine (tbrdma_qp.c) - the real create/modify/destroy logic,
  * called both by the ib_* verb methods and by the white-box self-test.
@@ -123,6 +150,7 @@ int	tbrdma_qp_modify(struct tbrdma_qp *, enum ib_qp_state new_state,
 	    u32 dest_qpn, const u8 dgid[16]);
 void	tbrdma_qp_free(struct tbrdma_qp *);
 int	tbrdma_selftest(struct tbrdma_dev *);
+int	tbrdma_mmap(struct ib_ucontext *, struct vm_area_struct *);
 
 /* tbrdma_verbs.c */
 int	tbrdma_query_device(struct ib_device *, struct ib_device_attr *,
@@ -160,6 +188,8 @@ void	tbrdma_destroy_cq(struct ib_cq *, struct ib_udata *);
 int	tbrdma_poll_cq(struct ib_cq *, int, struct ib_wc *);
 int	tbrdma_req_notify_cq(struct ib_cq *, enum ib_cq_notify_flags);
 struct ib_mr *tbrdma_get_dma_mr(struct ib_pd *, int);
+struct ib_mr *tbrdma_reg_user_mr(struct ib_pd *, u64 start, u64 length,
+	    u64 virt_addr, int access, struct ib_udata *);
 int	tbrdma_dereg_mr(struct ib_mr *, struct ib_udata *);
 
 #endif /* _TBRDMA_H_ */

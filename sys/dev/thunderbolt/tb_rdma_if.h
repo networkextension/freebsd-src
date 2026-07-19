@@ -94,6 +94,40 @@ int	tb_rdma_ring_stop(struct tb_rdma_ring *r);
 void	tb_rdma_ring_destroy(struct tb_rdma_ring *r);
 
 /*
+ * Hand a ring to userspace: stop the kernel RX poll callout so userspace is
+ * the sole drainer of this ring's descriptors (kernel-bypass data path).  Call
+ * after tb_rdma_ring_start().  Avoids the double-drain race (kernel rxpoll_co
+ * vs userspace polling the same DONE bits).
+ */
+void	tb_rdma_ring_set_userspace(struct tb_rdma_ring *r);
+
+/*
+ * Physical layout of a ring's DMA memory, for mmap to userspace.  The
+ * descriptor ring and frame pool are physically contiguous bus_dmamem_alloc
+ * buffers, so one phys base + size covers each (no IOMMU on this NHI, so bus
+ * address == physical address).
+ */
+struct tb_rdma_ring_mem {
+	uint64_t	desc_phys;	/* descriptor ring bus/phys base */
+	uint32_t	desc_size;	/* 16 * (tx_depth + rx_depth) */
+	uint64_t	frames_phys;	/* frame pool bus/phys base */
+	uint32_t	frames_size;	/* (tx_depth + rx_depth) * frame_size */
+	uint16_t	tx_depth;
+	uint16_t	rx_depth;
+	uint16_t	frame_size;
+	uint8_t		ring_num;
+};
+void	tb_rdma_ring_mmap_info(struct tb_rdma_ring *r,
+	    struct tb_rdma_ring_mem *out);
+
+/*
+ * BAR0 doorbell window: physical base + a size covering every ring's TX
+ * (0x8 + N*16) and RX (0x8008 + N*16) producer-index doorbell.
+ */
+void	tb_rdma_doorbell_bar(struct tb_rdma_dev *tbd, uint64_t *bar_pa,
+	    uint32_t *size);
+
+/*
  * Program one fabric hop-table entry on the root router.  RX hop is installed
  * on the lane adapter (out port = NHI, index = the peer's TX HopID); TX hop is
  * installed on the NHI adapter (out port = lane, index = our TX ring), with

@@ -16,6 +16,8 @@
  * (tb_icm_program_paths): RX hop on the lane adapter, TX hop on the NHI
  * adapter with egress flow control - see tb_rdma_program_{rx,tx}_hop.
  */
+#include <linux/mm.h>
+
 #include "tbrdma.h"
 
 /* if_tbt frame PDF convention (TBNET_PDF_FRAME_START/END) reused for RX SOF/EOF. */
@@ -139,6 +141,8 @@ tbrdma_qp_to_rtr(struct tbrdma_qp *qp, u32 dest_qpn, const u8 dgid[16])
 		return (-error);
 	}
 	qp->rx_started = true;
+	if (qp->userspace)
+		tb_rdma_ring_set_userspace(qp->rx_ring);
 
 	device_printf(tb_rdma_get_dev(tdev->tbd),
 	    "tbrdma: qp 0x%x -> RTR (lane %u, rx_hop %u, rx_ring %u, dest_qpn 0x%x)\n",
@@ -162,6 +166,8 @@ tbrdma_qp_to_rts(struct tbrdma_qp *qp)
 	if (error != 0)
 		return (-error);
 	qp->tx_started = true;
+	if (qp->userspace)
+		tb_rdma_ring_set_userspace(qp->tx_ring);
 
 	device_printf(tb_rdma_get_dev(tdev->tbd),
 	    "tbrdma: qp 0x%x -> RTS (tx_hop %u on NHI, tx_ring %u, next lane %u)\n",
@@ -302,4 +308,64 @@ out:
 		    error);
 	tbrdma_qp_free(qp);
 	return (error);
+}
+
+/*
+ * M2c: map a QP's ring memory + BAR0 doorbell window into userspace, so the
+ * data path is kernel-bypass (userspace posts descriptors and rings the
+ * doorbell directly).  vma->vm_pgoff selects the region (TBRDMA_MMAP_*).  The
+ * ring descriptor/frame memory is DMA-coherent contiguous kernel memory, so a
+ * single phys base + size maps each; the doorbell is BAR0 MMIO (non-cached).
+ */
+int
+tbrdma_mmap(struct ib_ucontext *ibctx, struct vm_area_struct *vma)
+{
+	struct tbrdma_ucontext *uc = to_tucontext(ibctx);
+	struct tbrdma_dev *tdev = to_tdev(ibctx->device);
+	struct tbrdma_qp *qp = uc->qp;
+	struct tb_rdma_ring_mem tm;
+	pgprot_t prot = vma->vm_page_prot;
+	unsigned long pfn;
+	size_t size;
+	uint64_t bar_pa;
+	uint32_t bar_size;
+
+	if (qp == NULL)
+		return (-EINVAL);
+
+	switch (vma->vm_pgoff) {
+	case TBRDMA_MMAP_DOORBELL:
+		tb_rdma_doorbell_bar(tdev->tbd, &bar_pa, &bar_size);
+		pfn = bar_pa >> PAGE_SHIFT;
+		size = round_page(bar_size);
+		prot = pgprot_noncached(prot);
+		break;
+	case TBRDMA_MMAP_TX_DESC:
+		tb_rdma_ring_mmap_info(qp->tx_ring, &tm);
+		pfn = tm.desc_phys >> PAGE_SHIFT;
+		size = round_page(tm.desc_size);
+		break;
+	case TBRDMA_MMAP_TX_FRAMES:
+		tb_rdma_ring_mmap_info(qp->tx_ring, &tm);
+		pfn = tm.frames_phys >> PAGE_SHIFT;
+		size = round_page(tm.frames_size);
+		break;
+	case TBRDMA_MMAP_RX_DESC:
+		tb_rdma_ring_mmap_info(qp->rx_ring, &tm);
+		pfn = tm.desc_phys >> PAGE_SHIFT;
+		size = round_page(tm.desc_size);
+		break;
+	case TBRDMA_MMAP_RX_FRAMES:
+		tb_rdma_ring_mmap_info(qp->rx_ring, &tm);
+		pfn = tm.frames_phys >> PAGE_SHIFT;
+		size = round_page(tm.frames_size);
+		break;
+	default:
+		return (-EINVAL);
+	}
+
+	if (vma->vm_end - vma->vm_start != size)
+		return (-EINVAL);
+
+	return (rdma_user_mmap_io(ibctx, vma, pfn, size, prot, NULL));
 }

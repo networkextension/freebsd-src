@@ -14,6 +14,14 @@
  * Verb shapes cross-checked field-for-field against
  * sys/dev/mlx4/mlx4_ib/mlx4_ib_main.c on this tree.
  */
+#include <sys/param.h>
+#include <sys/proc.h>
+#include <vm/vm.h>
+#include <vm/vm_page.h>
+#include <vm/vm_map.h>
+#include <vm/vm_extern.h>
+#include <vm/pmap.h>
+
 #include "tbrdma.h"
 
 int
@@ -203,6 +211,15 @@ tbrdma_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attr,
 	if (IS_ERR(qp))
 		return (ERR_CAST(qp));
 
+	/*
+	 * Userspace QP (udata present): rings will be handed off for
+	 * kernel-bypass, and mmap() looks the QP up via the ucontext.
+	 */
+	if (udata != NULL && pd->uobject != NULL) {
+		qp->userspace = true;
+		to_tucontext(pd->uobject->context)->qp = qp;
+	}
+
 	return (&qp->ibqp);
 }
 
@@ -287,12 +304,77 @@ struct ib_mr *
 tbrdma_get_dma_mr(struct ib_pd *pd, int acc)
 {
 
+	/* Kernel DMA MR (no userspace buffer) - not used by the UC datapath. */
 	return (ERR_PTR(-EOPNOTSUPP));
 }
 
-int
-tbrdma_dereg_mr(struct ib_mr *mr, struct ib_udata *udata)
+/*
+ * M2b: pin a userspace buffer and derive a region_id (the NHI bus address of
+ * the MR start).  This box's NHI has no active IOMMU, so a pinned page's
+ * physical address IS the bus address the DMA engine uses - so we hold the
+ * user pages natively (vm_fault_quick_hold_pages) and read their physical
+ * addresses directly, rather than ib_umem_get(), whose internal
+ * linux_dma_map_sg against our (non-PCI, dma_priv-less) ib_device faults.
+ * Under an SMMU this would instead bus_dmamap_load on the nhi parent_dmat (R2).
+ */
+struct ib_mr *
+tbrdma_reg_user_mr(struct ib_pd *pd, u64 start, u64 length, u64 virt_addr,
+    int access, struct ib_udata *udata)
 {
+	struct tbrdma_dev *tdev = to_tdev(pd->device);
+	struct tbrdma_mr *mr;
+	vm_map_t map;
+	vm_offset_t base;
+	int npages, held;
 
-	return (-EOPNOTSUPP);
+	base = trunc_page((vm_offset_t)start);
+	npages = atop(round_page((vm_offset_t)start + length) - base);
+	if (npages <= 0)
+		return (ERR_PTR(-EINVAL));
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (mr == NULL)
+		return (ERR_PTR(-ENOMEM));
+
+	mr->pages = malloc(npages * sizeof(vm_page_t), M_TEMP,
+	    M_WAITOK | M_ZERO);
+	mr->length = length;
+
+	map = &curproc->p_vmspace->vm_map;
+	held = vm_fault_quick_hold_pages(map, base, ptoa(npages),
+	    VM_PROT_READ | VM_PROT_WRITE, mr->pages, npages);
+	if (held != npages) {
+		if (held > 0)
+			vm_page_unhold_pages(mr->pages, held);
+		free(mr->pages, M_TEMP);
+		kfree(mr);
+		return (ERR_PTR(-EFAULT));
+	}
+	mr->npages = npages;
+
+	mr->dma_base = VM_PAGE_TO_PHYS(mr->pages[0]) +
+	    ((vm_offset_t)start & PAGE_MASK);
+	mr->region_id = (u32)(mr->dma_base >> PAGE_SHIFT);
+	mr->ibmr.lkey = mr->ibmr.rkey = mr->region_id;
+
+	device_printf(tb_rdma_get_dev(tdev->tbd),
+	    "tbrdma: reg_mr va=0x%jx len=%ju npages=%d region_id=0x%x "
+	    "dma_base=0x%jx\n", (uintmax_t)virt_addr, (uintmax_t)length,
+	    npages, mr->region_id, (uintmax_t)mr->dma_base);
+
+	return (&mr->ibmr);
+}
+
+int
+tbrdma_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
+{
+	struct tbrdma_mr *mr = to_tmr(ibmr);
+
+	if (mr->pages != NULL) {
+		if (mr->npages > 0)
+			vm_page_unhold_pages(mr->pages, mr->npages);
+		free(mr->pages, M_TEMP);
+	}
+	kfree(mr);
+	return (0);
 }

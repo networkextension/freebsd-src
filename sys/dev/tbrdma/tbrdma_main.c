@@ -56,7 +56,14 @@ tbrdma_fill_device(struct tbrdma_dev *tdev)
 	    (1ull << IB_USER_VERBS_CMD_QUERY_DEVICE)	|
 	    (1ull << IB_USER_VERBS_CMD_QUERY_PORT)	|
 	    (1ull << IB_USER_VERBS_CMD_ALLOC_PD)	|
-	    (1ull << IB_USER_VERBS_CMD_DEALLOC_PD);
+	    (1ull << IB_USER_VERBS_CMD_DEALLOC_PD)	|
+	    (1ull << IB_USER_VERBS_CMD_REG_MR)		|
+	    (1ull << IB_USER_VERBS_CMD_DEREG_MR)	|
+	    (1ull << IB_USER_VERBS_CMD_CREATE_CQ)	|
+	    (1ull << IB_USER_VERBS_CMD_DESTROY_CQ)	|
+	    (1ull << IB_USER_VERBS_CMD_CREATE_QP)	|
+	    (1ull << IB_USER_VERBS_CMD_MODIFY_QP)	|
+	    (1ull << IB_USER_VERBS_CMD_DESTROY_QP);
 
 	/*
 	 * driver_id + core object sizes.  Not INIT_IB_DEVICE_OPS (that macro
@@ -93,7 +100,9 @@ tbrdma_fill_device(struct tbrdma_dev *tdev)
 	ibdev->poll_cq = tbrdma_poll_cq;
 	ibdev->req_notify_cq = tbrdma_req_notify_cq;
 	ibdev->get_dma_mr = tbrdma_get_dma_mr;
+	ibdev->reg_user_mr = tbrdma_reg_user_mr;
 	ibdev->dereg_mr = tbrdma_dereg_mr;
+	ibdev->mmap = tbrdma_mmap;
 }
 
 static void
