@@ -94,6 +94,21 @@ tbrdma_get_link_layer(struct ib_device *ibdev, u8 port)
 	return (IB_LINK_LAYER_ETHERNET);
 }
 
+/*
+ * Return the tbt0 netdev (ref-held) so the RoCE GID table populates from its
+ * IP addresses (GID = Thunderbolt-IP).  Non-NULL get_netdev is what un-gates
+ * ib_enum_roce_netdev -> the whole GID-population walk.
+ */
+if_t
+tbrdma_get_netdev(struct ib_device *ibdev, u8 port)
+{
+	struct tbrdma_dev *tdev = to_tdev(ibdev);
+
+	if (port != 1)
+		return (NULL);
+	return ((if_t)tb_rdma_get_netdev(tdev->tbd));
+}
+
 int
 tbrdma_query_gid(struct ib_device *ibdev, u8 port, int index,
     union ib_gid *gid)
@@ -213,11 +228,29 @@ tbrdma_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attr,
 
 	/*
 	 * Userspace QP (udata present): rings will be handed off for
-	 * kernel-bypass, and mmap() looks the QP up via the ucontext.
+	 * kernel-bypass, and mmap() looks the QP up via the ucontext.  Return
+	 * the ring metadata (frame-pool bus addresses + geometry) so userspace
+	 * can write descriptors that point at the right DMA buffers.
 	 */
 	if (udata != NULL && pd->uobject != NULL) {
+		struct tbrdma_uresp_create_qp resp;
+		struct tb_rdma_ring_mem txm, rxm;
+
 		qp->userspace = true;
 		to_tucontext(pd->uobject->context)->qp = qp;
+
+		tb_rdma_ring_mmap_info(qp->tx_ring, &txm);
+		tb_rdma_ring_mmap_info(qp->rx_ring, &rxm);
+		memset(&resp, 0, sizeof(resp));
+		resp.tx_frames_phys = txm.frames_phys;
+		resp.rx_frames_phys = rxm.frames_phys;
+		resp.tx_ringnum = qp->tx_ringnum;
+		resp.rx_ringnum = qp->rx_ringnum;
+		resp.tx_depth = txm.tx_depth;
+		resp.rx_depth = rxm.rx_depth;
+		resp.frame_size = txm.frame_size;
+		if (udata->outlen >= sizeof(resp))
+			ib_copy_to_udata(udata, &resp, sizeof(resp));
 	}
 
 	return (&qp->ibqp);

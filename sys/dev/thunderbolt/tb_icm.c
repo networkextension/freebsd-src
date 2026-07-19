@@ -159,6 +159,13 @@ tb_icm_get_peer(struct tb_icm *icm, struct tb_rdma_peer *out)
 	return (icm->has_peer ? 0 : ENOTCONN);
 }
 
+/* Accessor for the RDMA provider: the ThunderboltIP net softc (owns tbt0). */
+struct tbnet_softc *
+tb_icm_get_net(struct tb_icm *icm)
+{
+	return (icm != NULL ? icm->net : NULL);
+}
+
 /* ---- ring-0 control frame wire I/O (native <-> big-endian dword + CRC) ---- */
 
 static int

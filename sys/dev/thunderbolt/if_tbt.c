@@ -130,6 +130,13 @@ tbnet_reass_reset(struct tbnet_softc *ts)
  * come up in tbnet_connect() once the ThunderboltIP login + APPROVE complete.
  * The MAC is caller-supplied and stable (peer-independent).
  */
+/* Accessor for the RDMA provider: the resident tbt0 ifnet (RoCE GID source). */
+struct ifnet *
+tbnet_get_ifp(struct tbnet_softc *ts)
+{
+	return (ts != NULL ? (struct ifnet *)ts->ifp : NULL);
+}
+
 int
 tbnet_create(struct nhi_softc *nsc, const uint8_t *mac, struct tbnet_softc **tsp)
 {

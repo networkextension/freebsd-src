@@ -28,10 +28,15 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#include <sys/socket.h>
+#include <net/if.h>
+#include <net/if_var.h>
+
 #include <dev/thunderbolt/nhi_var.h>
 #include <dev/thunderbolt/tb_reg.h>
 #include <dev/thunderbolt/tbcfg_reg.h>
 #include <dev/thunderbolt/router_var.h>
+#include <dev/thunderbolt/if_tbt.h>
 #include <dev/thunderbolt/tb_rdma_if.h>
 
 /*
@@ -173,6 +178,23 @@ int
 tb_rdma_get_peer(struct tb_rdma_dev *tbd, struct tb_rdma_peer *out)
 {
 	return (tb_icm_get_peer(tbd->sc->icm, out));
+}
+
+struct ifnet *
+tb_rdma_get_netdev(struct tb_rdma_dev *tbd)
+{
+	struct tbnet_softc *net;
+	struct ifnet *ifp;
+
+	if (tbd->sc->icm == NULL)
+		return (NULL);
+	net = tb_icm_get_net(tbd->sc->icm);
+	if (net == NULL)
+		return (NULL);
+	ifp = tbnet_get_ifp(net);
+	if (ifp != NULL)
+		if_ref((if_t)ifp);	/* core dev_puts after use */
+	return (ifp);
 }
 
 int

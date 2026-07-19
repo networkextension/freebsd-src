@@ -79,6 +79,7 @@ tbrdma_fill_device(struct tbrdma_dev *tdev)
 	ibdev->query_device = tbrdma_query_device;
 	ibdev->query_port = tbrdma_query_port;
 	ibdev->get_link_layer = tbrdma_get_link_layer;
+	ibdev->get_netdev = tbrdma_get_netdev;
 	ibdev->query_gid = tbrdma_query_gid;
 	ibdev->add_gid = tbrdma_add_gid;
 	ibdev->del_gid = tbrdma_del_gid;

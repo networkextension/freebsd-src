@@ -21,6 +21,8 @@
 
 struct nhi_softc;
 struct tb_icm;
+struct tbnet_softc;
+struct ifnet;
 
 /*
  * Opaque per-controller handle.  Defined in tb_rdma_shim.c; tbrdma.ko only
@@ -75,6 +77,16 @@ int	tb_rdma_get_peer(struct tb_rdma_dev *tbd, struct tb_rdma_peer *out);
 
 /* Implemented in tb_icm.c (where struct tb_icm is visible). */
 int	tb_icm_get_peer(struct tb_icm *icm, struct tb_rdma_peer *out);
+struct tbnet_softc *tb_icm_get_net(struct tb_icm *icm);
+
+/*
+ * The resident tbt0 ifnet, ref-held (if_ref).  tbrdma.ko returns this from the
+ * ib_device get_netdev op so the RoCE GID table populates from tbt0's IP
+ * (GID = the Thunderbolt-IP address, Apple's model).  Caller releases with
+ * if_rele (the OFED core does dev_put after use).  NULL if no net softc yet.
+ * (if_t == struct ifnet *; struct form avoids a <net/if.h> dep in this header.)
+ */
+struct ifnet *tb_rdma_get_netdev(struct tb_rdma_dev *tbd);
 
 /* Opaque data-ring handle (wraps struct nhi_ring_pair). */
 struct tb_rdma_ring;

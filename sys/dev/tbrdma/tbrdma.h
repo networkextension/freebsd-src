@@ -45,6 +45,22 @@
 #define	TBRDMA_NHI_PORT_ADAP	7	/* NHI adapter port (== TB_RDMA_NHI_PORT) */
 
 /*
+ * create_qp udata response: ring metadata userspace needs to drive the
+ * kernel-bypass data path (frame-pool BUS addresses for descriptors + geometry).
+ * Shared verbatim with tbrdma-userspace/tbrdma.h.
+ */
+struct tbrdma_uresp_create_qp {
+	uint64_t	tx_frames_phys;
+	uint64_t	rx_frames_phys;
+	uint32_t	tx_ringnum;
+	uint32_t	rx_ringnum;
+	uint32_t	tx_depth;
+	uint32_t	rx_depth;
+	uint32_t	frame_size;
+	uint32_t	pad;
+};
+
+/*
  * mmap() offset selectors (as page indices, i.e. vma->vm_pgoff): userspace
  * mmaps each region of its QP at these fixed offsets on the uverbs fd.
  */
@@ -157,6 +173,7 @@ int	tbrdma_query_device(struct ib_device *, struct ib_device_attr *,
 	    struct ib_udata *);
 int	tbrdma_query_port(struct ib_device *, u8, struct ib_port_attr *);
 enum rdma_link_layer tbrdma_get_link_layer(struct ib_device *, u8);
+if_t	tbrdma_get_netdev(struct ib_device *, u8);
 int	tbrdma_query_gid(struct ib_device *, u8, int, union ib_gid *);
 int	tbrdma_add_gid(const struct ib_gid_attr *, void **);
 int	tbrdma_del_gid(const struct ib_gid_attr *, void **);

@@ -12,9 +12,12 @@
 
 struct nhi_softc;
 struct tbnet_softc;
+struct ifnet;
 
 int tbnet_create(struct nhi_softc *nsc, const uint8_t *mac,
     struct tbnet_softc **tsp);
+/* if_t == struct ifnet *; use the struct form to avoid a <net/if.h> dep. */
+struct ifnet *tbnet_get_ifp(struct tbnet_softc *ts);
 int tbnet_connect(struct tbnet_softc *ts);
 void tbnet_disconnect(struct tbnet_softc *ts);
 void tbnet_destroy(struct tbnet_softc *ts);
