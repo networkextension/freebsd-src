@@ -76,7 +76,15 @@ tbrdma_query_port(struct ib_device *ibdev, u8 port,
 	props->phys_state = IB_PORT_PHYS_STATE_LINK_UP;
 	props->max_mtu = IB_MTU_4096;
 	props->active_mtu = IB_MTU_4096;
-	props->gid_tbl_len = 1;
+	/*
+	 * >1 so the RoCE table holds every tbt0 address, not just the first
+	 * (link-local IPv6).  Cross-vendor RTR needs an IPv4-mapped GID on the
+	 * TB-local subnet: Apple's IORDMAFamily resolves the remote GID via
+	 * neighbor discovery on the RDMA netdev, and a link-local IPv6 GID is
+	 * not ND-resolvable over the Thunderbolt link ("nd6_lookup_ipv6 failed"
+	 * -> "Failed INIT->RTR"), whereas ::ffff:<tbt0-IPv4> ARPs fine.
+	 */
+	props->gid_tbl_len = 16;
 	props->pkey_tbl_len = 1;
 	props->max_msg_sz = TBRDMA_MAX_MSG_SZ;
 	props->port_cap_flags = 0;
