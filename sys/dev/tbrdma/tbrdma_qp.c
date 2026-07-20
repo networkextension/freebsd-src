@@ -79,10 +79,17 @@ tbrdma_qp_alloc(struct tbrdma_dev *tdev, u32 max_send_wr, u32 max_recv_wr)
 		error = -error;
 		goto fail_tx;
 	}
-	/* RX ring: FRAME+E2E, SOF/EOF filter; credits egress on the TX ring. */
+	/*
+	 * RX ring: FRAME+E2E.  The SOF/EOF masks are the NHI's per-PDF frame
+	 * filter: a frame is only delivered if its start/end PDF bit is set here.
+	 * TBIP (if_tbt) uses PDF 1/2 and works, but Apple's RDMA is a distinct
+	 * XDomain service whose data-frame PDF is not documented - filtering on
+	 * 1/2 silently drops its frames.  Accept ANY SOF/EOF PDF (0xffff) so the
+	 * peer's frame lands and TBRDMA_DUMP can reveal its real PDF/format; can
+	 * be narrowed once the RDMA data-frame PDF is known.
+	 */
 	error = tb_rdma_ring_create(tdev->tbd, qp->rx_ringnum, depth, depth,
-	    TBRDMA_FRAME_SIZE, qp->tx_ringnum,
-	    1u << TBRDMA_PDF_FRAME_START, 1u << TBRDMA_PDF_FRAME_END,
+	    TBRDMA_FRAME_SIZE, qp->tx_ringnum, 0xffffu, 0xffffu,
 	    &qp->rx_ring);
 	if (error != 0) {
 		error = -error;
