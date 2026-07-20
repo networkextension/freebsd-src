@@ -20,9 +20,11 @@
 
 #include "tbrdma.h"
 
-/* if_tbt frame PDF convention (TBNET_PDF_FRAME_START/END) reused for RX SOF/EOF. */
-#define	TBRDMA_PDF_FRAME_START	1
-#define	TBRDMA_PDF_FRAME_END	2
+/*
+ * The RX-ring per-PDF frame-accept masks now live in the live-tunable globals
+ * tbrdma_rx_sof_mask / tbrdma_rx_eof_mask (dev.tbrdma.rx_{sof,eof}_mask,
+ * default = Apple RDMA's captured SOF PDF 0 / EOF PDF 3).
+ */
 
 static int
 tbrdma_alloc_ringnum(struct tbrdma_dev *tdev)
@@ -81,15 +83,15 @@ tbrdma_qp_alloc(struct tbrdma_dev *tdev, u32 max_send_wr, u32 max_recv_wr)
 	}
 	/*
 	 * RX ring: FRAME+E2E.  The SOF/EOF masks are the NHI's per-PDF frame
-	 * filter: a frame is only delivered if its start/end PDF bit is set here.
-	 * TBIP (if_tbt) uses PDF 1/2 and works, but Apple's RDMA is a distinct
-	 * XDomain service whose data-frame PDF is not documented - filtering on
-	 * 1/2 silently drops its frames.  Accept ANY SOF/EOF PDF (0xffff) so the
-	 * peer's frame lands and TBRDMA_DUMP can reveal its real PDF/format; can
-	 * be narrowed once the RDMA data-frame PDF is known.
+	 * filter (a frame is delivered only if its start/end PDF bit is set).
+	 * Apple's RDMA data frames use SOF PDF 0 / EOF PDF 3 (captured live),
+	 * distinct from if_tbt's SOF 1 / EOF 2.  The masks are live-tunable
+	 * (dev.tbrdma.rx_{sof,eof}_mask) so the exact PDF can be re-derived
+	 * without a rebuild - set 0xffff to accept any PDF while capturing.
 	 */
 	error = tb_rdma_ring_create(tdev->tbd, qp->rx_ringnum, depth, depth,
-	    TBRDMA_FRAME_SIZE, qp->tx_ringnum, 0xffffu, 0xffffu,
+	    TBRDMA_FRAME_SIZE, qp->tx_ringnum,
+	    (uint16_t)tbrdma_rx_sof_mask, (uint16_t)tbrdma_rx_eof_mask,
 	    &qp->rx_ring);
 	if (error != 0) {
 		error = -error;

@@ -216,6 +216,20 @@ SYSCTL_PROC(_dev_tbrdma, OID_AUTO, selftest,
     tbrdma_sysctl_selftest, "I",
     "write 1: run the QP RESET->INIT->RTR->RTS control-plane self-test");
 
+/*
+ * RX-ring per-PDF frame-accept masks, read at create_qp time so they can be
+ * retuned live (no rebuild) while reverse-engineering a peer's data-frame PDF.
+ * Defaults = Apple RDMA's captured SOF PDF 0 / EOF PDF 3.  Set either to
+ * 0xffff to accept ANY PDF (the diagnostic that first proved delivery), then
+ * re-run the peer SEND and read the captured descriptor's real SOF/EOF.
+ */
+int tbrdma_rx_sof_mask = 1u << 0;	/* Apple RDMA SOF PDF 0 */
+int tbrdma_rx_eof_mask = 1u << 3;	/* Apple RDMA EOF PDF 3 */
+SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_sof_mask, CTLFLAG_RWTUN,
+    &tbrdma_rx_sof_mask, 0, "RX ring SOF PDF accept bitmask (0xffff = any)");
+SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_eof_mask, CTLFLAG_RWTUN,
+    &tbrdma_rx_eof_mask, 0, "RX ring EOF PDF accept bitmask (0xffff = any)");
+
 static int __init
 tbrdma_init(void)
 {

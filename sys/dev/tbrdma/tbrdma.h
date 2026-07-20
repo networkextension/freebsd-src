@@ -171,6 +171,10 @@ int	tbrdma_mmap(struct ib_ucontext *, struct vm_area_struct *);
 /* tbrdma_verbs.c */
 int	tbrdma_query_device(struct ib_device *, struct ib_device_attr *,
 	    struct ib_udata *);
+/* Live-tunable RX-ring per-PDF frame-accept masks (dev.tbrdma.rx_{sof,eof}_mask). */
+extern int tbrdma_rx_sof_mask;
+extern int tbrdma_rx_eof_mask;
+
 int	tbrdma_query_port(struct ib_device *, u8, struct ib_port_attr *);
 enum rdma_link_layer tbrdma_get_link_layer(struct ib_device *, u8);
 if_t	tbrdma_get_netdev(struct ib_device *, u8);
