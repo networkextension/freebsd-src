@@ -209,12 +209,74 @@ tbrdma_sysctl_selftest(SYSCTL_HANDLER_ARGS)
 	return (e < 0 ? -e : e);
 }
 
+/*
+ * Diagnostic (write 1): dump the fabric hop-table path config for the active
+ * device - credits + routing of the NHI-adapter TX hops and the lane-adapter
+ * RX hops.  Pairs with the userspace TBRDMA_DUMP TX-done log to answer "is the
+ * NHI actually transmitting, and are the E2E credits what we programmed?" when
+ * a multi-iteration transfer stalls (#85).  DW0: out_hop[0:10], out_port[11:16],
+ * credits[17:24], enable[31].
+ */
+static int
+tbrdma_sysctl_dumphops(SYSCTL_HANDLER_ARGS)
+{
+	struct tbrdma_link *l;
+	struct tbrdma_dev *tdev = NULL;
+	device_t dev;
+	uint32_t hop[2];
+	int val = 0, error;
+	u_int h;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val == 0)
+		return (0);
+
+	mutex_lock(&tbrdma_dev_lock);
+	l = list_first_entry_or_null(&tbrdma_dev_list, struct tbrdma_link, link);
+	if (l != NULL)
+		tdev = l->tdev;
+	mutex_unlock(&tbrdma_dev_lock);
+	if (tdev == NULL)
+		return (ENXIO);
+	dev = tb_rdma_get_dev(tdev->tbd);
+
+	device_printf(dev, "tbrdma hops: NHI adapter 7 (TX):\n");
+	for (h = 0; h <= 32; h++) {
+		if (tb_rdma_read_hop(tdev->tbd, 7, h, hop) != 0)
+			continue;
+		if ((hop[0] & (1u << 31)) == 0)
+			continue;		/* path not enabled */
+		device_printf(dev, "  hop %u: dw0=0x%08x dw1=0x%08x "
+		    "out_hop=%u out_port=%u credits=%u\n", h, hop[0], hop[1],
+		    hop[0] & 0x7ffu, (hop[0] >> 11) & 0x3fu,
+		    (hop[0] >> 17) & 0xffu);
+	}
+	device_printf(dev, "tbrdma hops: lane adapter 1 (RX):\n");
+	for (h = 0; h <= 32; h++) {
+		if (tb_rdma_read_hop(tdev->tbd, 1, h, hop) != 0)
+			continue;
+		if ((hop[0] & (1u << 31)) == 0)
+			continue;
+		device_printf(dev, "  hop %u: dw0=0x%08x dw1=0x%08x "
+		    "out_hop=%u out_port=%u credits=%u\n", h, hop[0], hop[1],
+		    hop[0] & 0x7ffu, (hop[0] >> 11) & 0x3fu,
+		    (hop[0] >> 17) & 0xffu);
+	}
+	return (0);
+}
+
 static SYSCTL_NODE(_dev, OID_AUTO, tbrdma, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Thunderbolt RDMA provider");
 SYSCTL_PROC(_dev_tbrdma, OID_AUTO, selftest,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
     tbrdma_sysctl_selftest, "I",
     "write 1: run the QP RESET->INIT->RTR->RTS control-plane self-test");
+SYSCTL_PROC(_dev_tbrdma, OID_AUTO, dumphops,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
+    tbrdma_sysctl_dumphops, "I",
+    "write 1: dump enabled fabric hop path configs (credits/routing)");
 
 /*
  * RX-ring per-PDF frame-accept masks, read at create_qp time so they can be
