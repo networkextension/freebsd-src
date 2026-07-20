@@ -1776,8 +1776,18 @@ nhi_rxpoll_timer(void *arg)
 		return;
 	}
 	nhi_ring_process(r);
-	callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
-	    nhi_rxpoll_timer, r, C_PREL(2));
+	/*
+	 * Re-check rxpoll_active BEFORE re-arming.  We passed the check at the
+	 * top, but a concurrent nhi_ring_stop() (rxpoll_active=false + callout_
+	 * stop) can land while we run nhi_ring_process(); re-arming here anyway
+	 * leaves the callout pending after the stop, and the subsequent
+	 * callout_drain()+free frees the ring with its callout still on the
+	 * callwheel - softclock_call_cc() then faults on freed memory.  This is
+	 * the self-rescheduling-callout trap (cf. tb_icm login_co dying flag).
+	 */
+	if (r->rxpoll_active)
+		callout_reset_sbt(&r->rxpoll_co, SBT_1US * nhi_rxpoll_us, 0,
+		    nhi_rxpoll_timer, r, C_PREL(2));
 }
 
 /*
