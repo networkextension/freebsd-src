@@ -1146,10 +1146,15 @@ int
 nhi_ring_stop(struct nhi_ring_pair *r)
 {
 
-	if (r->priv_tracker) {
-		r->rxpoll_active = false;
-		callout_stop(&r->rxpoll_co);
-	}
+	/*
+	 * nhi_ring_start() arms rxpoll_co for EVERY data ring (ring_num != 0),
+	 * independent of priv_tracker - so the callout lifecycle must be handled
+	 * unconditionally too.  Gating this on priv_tracker left a tbrdma-style
+	 * ring (priv_tracker == false) with its poll callout still pending after
+	 * stop; a later free then faulted softclock_call_cc on the freed callout.
+	 */
+	r->rxpoll_active = false;
+	callout_stop(&r->rxpoll_co);
 	return (nhi_deactivate_ring(r));
 }
 
@@ -1157,9 +1162,15 @@ void
 nhi_ring_destroy(struct nhi_ring_pair *r)
 {
 
+	/*
+	 * Drain the RX poll callout unconditionally (see nhi_ring_stop): it is
+	 * armed per ring_num != 0 regardless of priv_tracker, and freeing a ring
+	 * with a still-pending callout page-faults softclock_call_cc.  callout_co
+	 * was callout_init(,1) with no associated lock, so drain cannot deadlock.
+	 */
+	r->rxpoll_active = false;
+	callout_drain(&r->rxpoll_co);
 	if (r->priv_tracker) {
-		r->rxpoll_active = false;	/* stop the callout re-arming */
-		callout_drain(&r->rxpoll_co);
 		free(r->tracker, M_NHI);
 		r->tracker = NULL;
 		r->priv_tracker = false;
