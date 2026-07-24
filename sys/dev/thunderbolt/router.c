@@ -33,6 +33,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
+#include <sys/time.h>		/* ppsratecheck, struct timeval (#70) */
 #include <sys/module.h>
 #include <sys/bus.h>
 #include <sys/conf.h>
@@ -934,14 +935,23 @@ router_hotplug_intr(void *context, union nhi_ring_desc *ring,
 	uint32_t *msg;
 	bool unplug;
 
+	static struct timeval hp_lastlog;	/* #70: rate-limit the flood log */
+	static int hp_curpps;
+
 	route_hi = be32toh(nhicmd->data[0]) & ~0x80000000u;
 	route_lo = be32toh(nhicmd->data[1]);
 	ev = be32toh(nhicmd->data[2]);
 	port = ev & 0x3f;
 	unplug = (ev & (1u << 31)) != 0;
 
-	tb_printf(sc, "hotplug event: route 0x%08x%08x port %u %s\n",
-	    route_hi, route_lo, port, unplug ? "unplug" : "plug");
+	/*
+	 * A peer reboot makes the router re-transmit the same unplug event several
+	 * times a second until it is acked; log at most ~2/s so a stuck flood does
+	 * not bury the console.  The ack + teardown below still run every time.
+	 */
+	if (ppsratecheck(&hp_lastlog, &hp_curpps, 2))
+		tb_printf(sc, "hotplug event: route 0x%08x%08x port %u %s\n",
+		    route_hi, route_lo, port, unplug ? "unplug" : "plug");
 
 	ack = nhi_alloc_tx_frame(sc->ring0);
 	if (ack == NULL) {

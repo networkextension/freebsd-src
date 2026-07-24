@@ -240,7 +240,13 @@ tb_xdomain_build_dir(struct tb_xdomain *xd)
 	xdp_put_entry(b, e, "vendorid", 1, NHI_PROP_TYPE_VALUE, 0x1d6b); e += 4;
 	xdp_put_entry(b, e, "deviceid", 1, NHI_PROP_TYPE_VALUE, 0x1); e += 4;
 	xdp_put_entry(b, e, "devicerv", 1, NHI_PROP_TYPE_VALUE, 0x80000100); e += 4;
-	xdp_put_entry(b, e, "maxhopid", 1, NHI_PROP_TYPE_VALUE, 0x8); e += 4;
+	/*
+	 * maxhopid = the highest HopID a peer may use on a path toward us.  Must
+	 * cover our own RDMA hops: local_tx_hopid = TBRDMA_TX_HOPID_BASE(16)+ring
+	 * (e.g. 19) and the peer's TX HopID (seen at 9/10) - the old 0x8 advertised
+	 * a ceiling our own paths violate.  0x3f is the field max.
+	 */
+	xdp_put_entry(b, e, "maxhopid", 1, NHI_PROP_TYPE_VALUE, 0x3f); e += 4;
 	xdp_put_entry(b, e, "vendorid", fb_dw, NHI_PROP_TYPE_TEXT, fb_off); e += 4;
 	xdp_put_entry(b, e, "deviceid", hn_dw, NHI_PROP_TYPE_TEXT, hn_off); e += 4;
 	xdp_put_entry(b, e, "network", svc_len, NHI_PROP_TYPE_DIRECTORY, net_off); e += 4;

@@ -114,6 +114,9 @@ struct tb_icm {
 	/* session state (from nhi_softc in the standalone driver) */
 	bool			has_peer;
 	bool			paths_approved;
+	bool			link_down_active;	/* #70: debounce the unplug
+						 * flood - full teardown runs
+						 * once per down transition */
 	uint8_t			peer_uuid[16];
 	uint8_t			local_uuid[16];
 	uint32_t		peer_route_hi, peer_route_lo;
@@ -438,6 +441,17 @@ tb_icm_link_down(struct tb_icm *icm)
 
 	if (icm == NULL || icm->dying)
 		return;
+	/*
+	 * #70: a peer reboot makes the router flood port-1 unplug events "several
+	 * times a second" until they are acked; each one funnels here.  Run the
+	 * heavy teardown only on the first down transition - later duplicates are
+	 * cheap no-ops, so the system stays responsive and the hotplug-ack path is
+	 * not starved.  Cleared when the link comes back (tb_icm_link_up_hint /
+	 * XDOMAIN_CONNECTED).
+	 */
+	if (icm->link_down_active)
+		return;
+	icm->link_down_active = true;
 	callout_stop(&icm->login_co);
 	had_paths = icm->paths_approved;
 	taskqueue_enqueue(icm->tq, &icm->teardown_task);
@@ -455,6 +469,7 @@ tb_icm_link_up_hint(struct tb_icm *icm)
 {
 	if (icm == NULL || icm->dying)
 		return;
+	icm->link_down_active = false;	/* #70: re-arm the next down transition */
 	icm->xdkick_tries = 0;
 	callout_reset(&icm->login_co, hz, tb_icm_login_timer, icm);
 }
@@ -864,6 +879,7 @@ tb_icm_event_cb(void *context, union nhi_ring_desc *rdesc,
 		icm->peer_route_hi = le32dec(f + 40);
 		icm->peer_route_lo = le32dec(f + 44);
 		icm->has_peer = true;
+		icm->link_down_active = false;	/* #70: link is up again */
 		icm->login_sent = icm->login_received = icm->paths_approved = false;
 		icm->login_tries = icm->logout_kicks = icm->xdkick_tries = 0;
 		tb_xdomain_set_peer(icm->xd, icm->peer_uuid, icm->local_uuid,
