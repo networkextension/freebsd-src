@@ -150,18 +150,9 @@ tbrdma_qp_to_rtr(struct tbrdma_qp *qp, u32 dest_qpn, const u8 dgid[16])
 		return (-error);
 	}
 	qp->rx_started = true;
-	/*
-	 * #85: handing the ring to userspace also stops the kernel drainer's
-	 * per-frame CI write, which is what returns an E2E credit to the peer.
-	 * dev.tbrdma.bypass_drain=0 keeps that drainer attached so we can tell a
-	 * bypass credit-return failure apart from a peer-side stall.
-	 */
-	if (qp->userspace && tbrdma_bypass_drain)
+	/* Kernel-bypass data path: userspace becomes the sole drainer. */
+	if (qp->userspace)
 		tb_rdma_ring_set_userspace(qp->rx_ring);
-	else if (qp->userspace)
-		device_printf(tb_rdma_get_dev(tdev->tbd), "tbrdma: qp 0x%x rx_ring "
-		    "%u KEEPS kernel drainer (bypass_drain=0, #85 diagnostic)\n",
-		    qp->ibqp.qp_num, qp->rx_ringnum);
 
 	device_printf(tb_rdma_get_dev(tdev->tbd),
 	    "tbrdma: qp 0x%x -> RTR (lane %u, rx_hop %u, rx_ring %u, dest_qpn 0x%x)\n",

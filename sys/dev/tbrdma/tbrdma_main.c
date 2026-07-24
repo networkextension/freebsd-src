@@ -333,24 +333,6 @@ SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_sof_mask, CTLFLAG_RWTUN,
 SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_eof_mask, CTLFLAG_RWTUN,
     &tbrdma_rx_eof_mask, 0, "RX ring EOF PDF accept bitmask (0xffff = any)");
 
-/*
- * Diagnostic lever for the #85 multi-frame stall.  A userspace QP normally
- * hands its RX ring to userspace (kernel-bypass), which stops the kernel's
- * per-frame CI write - the very write that returns an E2E credit to the peer
- * (nhi.c, FRAME-mode drain).  The peer's transmitter is fully E2E-gated, so if
- * the bypass path fails to replenish credits the peer stalls mid-message.
- * Setting this to 0 leaves the kernel drainer attached, so the proven per-frame
- * credit return keeps running: if the peer then sends the whole message (RX PI
- * advances past the stall point, see dev.tbrdma.dumpring) the bypass credit
- * return is confirmed as the culprit.  Diagnostic only - with the kernel
- * draining, userspace does not receive the frames.
- */
-int tbrdma_bypass_drain = 1;
-SYSCTL_INT(_dev_tbrdma, OID_AUTO, bypass_drain, CTLFLAG_RWTUN,
-    &tbrdma_bypass_drain, 0,
-    "1: userspace QP owns its RX ring (kernel-bypass); 0: keep the kernel "
-    "drainer attached so its per-frame E2E credit return still fires (#85)");
-
 static int __init
 tbrdma_init(void)
 {
