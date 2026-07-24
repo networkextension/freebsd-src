@@ -318,13 +318,16 @@ SYSCTL_PROC(_dev_tbrdma, OID_AUTO, dumpring,
 
 /*
  * RX-ring per-PDF frame-accept masks, read at create_qp time so they can be
- * retuned live (no rebuild) while reverse-engineering a peer's data-frame PDF.
- * Defaults = Apple RDMA's captured SOF PDF 0 / EOF PDF 3.  Set either to
- * 0xffff to accept ANY PDF (the diagnostic that first proved delivery), then
- * re-run the peer SEND and read the captured descriptor's real SOF/EOF.
+ * retuned live (no rebuild).  Defaults are Apple RDMA's REAL framing, taken
+ * from disassembling its userspace provider (libthunderboltrdma.dylib,
+ * _tbt_post_send): SOF PDF is 1 on every frame; EOF PDF is 2 on a non-final
+ * frame and 3 on the final one.  Accepting only these lets the NHI reassemble
+ * a multi-packet frame into one descriptor - with the wide-open 0xffff mask
+ * (the RE-phase diagnostic) the NHI instead delivers each ~252B fabric packet
+ * as its own frame, splitting a single 512B message into 252/12/240.
  */
-int tbrdma_rx_sof_mask = 1u << 0;	/* Apple RDMA SOF PDF 0 */
-int tbrdma_rx_eof_mask = 1u << 3;	/* Apple RDMA EOF PDF 3 */
+int tbrdma_rx_sof_mask = 1u << 1;		/* Apple RDMA SOF PDF 1 */
+int tbrdma_rx_eof_mask = (1u << 2) | (1u << 3);	/* Apple RDMA EOF PDF 2 (non-final) | 3 (final) */
 SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_sof_mask, CTLFLAG_RWTUN,
     &tbrdma_rx_sof_mask, 0, "RX ring SOF PDF accept bitmask (0xffff = any)");
 SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_eof_mask, CTLFLAG_RWTUN,
