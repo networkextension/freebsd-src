@@ -174,6 +174,9 @@ int	tbrdma_query_device(struct ib_device *, struct ib_device_attr *,
 /* Live-tunable RX-ring per-PDF frame-accept masks (dev.tbrdma.rx_{sof,eof}_mask). */
 extern int tbrdma_rx_sof_mask;
 extern int tbrdma_rx_eof_mask;
+/* #85 diagnostic: 0 = keep the kernel RX drainer (and its per-frame E2E credit
+ * return) attached even for a userspace QP.  See tbrdma_main.c. */
+extern int tbrdma_bypass_drain;
 
 int	tbrdma_query_port(struct ib_device *, u8, struct ib_port_attr *);
 enum rdma_link_layer tbrdma_get_link_layer(struct ib_device *, u8);

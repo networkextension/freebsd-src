@@ -114,6 +114,15 @@ void	tb_rdma_ring_destroy(struct tb_rdma_ring *r);
 void	tb_rdma_ring_set_userspace(struct tb_rdma_ring *r);
 
 /*
+ * Diagnostic (#85): read back a QP's live NHI ring-table state - TX/RX BASE0
+ * (VALID / E2E / paired E2E HopID) and the PI/CI doorbells.  The peer's
+ * transmitter is fully E2E-gated, so an unarmed RX E2E bit or a zero paired
+ * HopID silently stops credit replenishment and stalls multi-frame messages.
+ */
+void	tb_rdma_dump_ring_regs(struct tb_rdma_dev *tbd, u_int txring,
+	    u_int rxring);
+
+/*
  * Physical layout of a ring's DMA memory, for mmap to userspace.  The
  * descriptor ring and frame pool are physically contiguous bus_dmamem_alloc
  * buffers, so one phys base + size covers each (no IOMMU on this NHI, so bus

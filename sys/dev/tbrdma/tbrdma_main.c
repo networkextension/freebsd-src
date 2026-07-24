@@ -267,6 +267,40 @@ tbrdma_sysctl_dumphops(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/*
+ * Dump one NHI ring's live table state (#85): both the TX and RX table entries
+ * for the given ring number - VALID / E2E armed / paired E2E HopID - plus the
+ * PI/CI doorbell.  The peer's transmitter is fully E2E-gated and blocks in
+ * hardware until our RX ring returns credits, so this lets us diff a known-good
+ * kernel-drained ring (if_tbt's TBIP data ring, which sustains multi-frame RX
+ * at SMB speed) against a stalling kernel-bypass QP ring - without generating
+ * any traffic toward the peer.
+ */
+static int
+tbrdma_sysctl_dumpring(SYSCTL_HANDLER_ARGS)
+{
+	struct tbrdma_link *l;
+	struct tbrdma_dev *tdev = NULL;
+	int val = -1, error;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (val < 0)
+		return (0);
+
+	mutex_lock(&tbrdma_dev_lock);
+	l = list_first_entry_or_null(&tbrdma_dev_list, struct tbrdma_link, link);
+	if (l != NULL)
+		tdev = l->tdev;
+	mutex_unlock(&tbrdma_dev_lock);
+	if (tdev == NULL)
+		return (ENXIO);
+
+	tb_rdma_dump_ring_regs(tdev->tbd, (u_int)val, (u_int)val);
+	return (0);
+}
+
 static SYSCTL_NODE(_dev, OID_AUTO, tbrdma, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Thunderbolt RDMA provider");
 SYSCTL_PROC(_dev_tbrdma, OID_AUTO, selftest,
@@ -277,6 +311,10 @@ SYSCTL_PROC(_dev_tbrdma, OID_AUTO, dumphops,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
     tbrdma_sysctl_dumphops, "I",
     "write 1: dump enabled fabric hop path configs (credits/routing)");
+SYSCTL_PROC(_dev_tbrdma, OID_AUTO, dumpring,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, 0, 0,
+    tbrdma_sysctl_dumpring, "I",
+    "write N: dump NHI ring N's TX/RX table state (E2E armed, hopid, PI/CI)");
 
 /*
  * RX-ring per-PDF frame-accept masks, read at create_qp time so they can be
@@ -291,6 +329,24 @@ SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_sof_mask, CTLFLAG_RWTUN,
     &tbrdma_rx_sof_mask, 0, "RX ring SOF PDF accept bitmask (0xffff = any)");
 SYSCTL_INT(_dev_tbrdma, OID_AUTO, rx_eof_mask, CTLFLAG_RWTUN,
     &tbrdma_rx_eof_mask, 0, "RX ring EOF PDF accept bitmask (0xffff = any)");
+
+/*
+ * Diagnostic lever for the #85 multi-frame stall.  A userspace QP normally
+ * hands its RX ring to userspace (kernel-bypass), which stops the kernel's
+ * per-frame CI write - the very write that returns an E2E credit to the peer
+ * (nhi.c, FRAME-mode drain).  The peer's transmitter is fully E2E-gated, so if
+ * the bypass path fails to replenish credits the peer stalls mid-message.
+ * Setting this to 0 leaves the kernel drainer attached, so the proven per-frame
+ * credit return keeps running: if the peer then sends the whole message (RX PI
+ * advances past the stall point, see dev.tbrdma.dumpring) the bypass credit
+ * return is confirmed as the culprit.  Diagnostic only - with the kernel
+ * draining, userspace does not receive the frames.
+ */
+int tbrdma_bypass_drain = 1;
+SYSCTL_INT(_dev_tbrdma, OID_AUTO, bypass_drain, CTLFLAG_RWTUN,
+    &tbrdma_bypass_drain, 0,
+    "1: userspace QP owns its RX ring (kernel-bypass); 0: keep the kernel "
+    "drainer attached so its per-frame E2E credit return still fires (#85)");
 
 static int __init
 tbrdma_init(void)

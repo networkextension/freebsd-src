@@ -150,8 +150,18 @@ tbrdma_qp_to_rtr(struct tbrdma_qp *qp, u32 dest_qpn, const u8 dgid[16])
 		return (-error);
 	}
 	qp->rx_started = true;
-	if (qp->userspace)
+	/*
+	 * #85: handing the ring to userspace also stops the kernel drainer's
+	 * per-frame CI write, which is what returns an E2E credit to the peer.
+	 * dev.tbrdma.bypass_drain=0 keeps that drainer attached so we can tell a
+	 * bypass credit-return failure apart from a peer-side stall.
+	 */
+	if (qp->userspace && tbrdma_bypass_drain)
 		tb_rdma_ring_set_userspace(qp->rx_ring);
+	else if (qp->userspace)
+		device_printf(tb_rdma_get_dev(tdev->tbd), "tbrdma: qp 0x%x rx_ring "
+		    "%u KEEPS kernel drainer (bypass_drain=0, #85 diagnostic)\n",
+		    qp->ibqp.qp_num, qp->rx_ringnum);
 
 	device_printf(tb_rdma_get_dev(tdev->tbd),
 	    "tbrdma: qp 0x%x -> RTR (lane %u, rx_hop %u, rx_ring %u, dest_qpn 0x%x)\n",
@@ -308,6 +318,14 @@ tbrdma_selftest(struct tbrdma_dev *tdev)
 	    hop) == 0)
 		device_printf(dev, "tbrdma selftest: TX hop[NHI,idx %u] = "
 		    "0x%08x 0x%08x\n", qp->tx_ringnum, hop[0], hop[1]);
+
+	/*
+	 * Read back the live NHI ring-table state (#85).  The peer's transmitter
+	 * blocks in hardware until our RX ring returns E2E credits, so confirm
+	 * RX_TABLE_E2E is really armed and the paired HopID landed non-zero - a
+	 * zero hop silently disables replenishment and stalls multi-frame sends.
+	 */
+	tb_rdma_dump_ring_regs(tdev->tbd, qp->tx_ringnum, qp->rx_ringnum);
 
 	device_printf(dev, "tbrdma selftest: QP reached RTS - control plane OK\n");
 	error = 0;

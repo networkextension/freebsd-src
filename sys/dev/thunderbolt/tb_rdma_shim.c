@@ -33,6 +33,7 @@
 #include <net/if_var.h>
 
 #include <dev/thunderbolt/nhi_var.h>
+#include <dev/thunderbolt/nhi_reg.h>
 #include <dev/thunderbolt/tb_reg.h>
 #include <dev/thunderbolt/tbcfg_reg.h>
 #include <dev/thunderbolt/router_var.h>
@@ -218,6 +219,36 @@ tb_rdma_ring_create(struct tb_rdma_dev *tbd, u_int ringnum, u_int tx_depth,
 	if (error == 0)
 		*out = (struct tb_rdma_ring *)r;
 	return (error);
+}
+
+/*
+ * Diagnostic read-back of a QP's NHI ring-table state (#85).  The peer's
+ * transmitter is fully E2E-gated: it blocks in hardware until our RX ring
+ * returns credits, so if RX_TABLE_E2E is not actually armed - or the paired
+ * TX HopID landed as 0, which silently disables replenishment - a multi-frame
+ * message stalls mid-flight and the peer reports retry-exhausted.  Read the
+ * live registers rather than trusting the programming path.  Read-only.
+ */
+void
+tb_rdma_dump_ring_regs(struct tb_rdma_dev *tbd, u_int txring, u_int rxring)
+{
+	struct nhi_softc *sc = tbd->sc;
+	uint32_t txb0, rxb0, txpici, rxpici;
+
+	txb0 = nhi_read_reg(sc, NHI_TX_RING_TABLE_BASE0 + txring * 32);
+	rxb0 = nhi_read_reg(sc, NHI_RX_RING_TABLE_BASE0 + rxring * 32);
+	txpici = nhi_read_reg(sc, NHI_TX_RING_PICI + txring * 16);
+	rxpici = nhi_read_reg(sc, NHI_RX_RING_PICI + rxring * 16);
+
+	device_printf(sc->dev, "tbrdma ringregs: TX%u BASE0=0x%08x VALID=%u "
+	    "E2E=%u | PICI=0x%08x (pi=%u ci=%u)\n", txring, txb0,
+	    (txb0 & TX_TABLE_VALID) ? 1 : 0, (txb0 & TX_TABLE_E2E) ? 1 : 0,
+	    txpici, txpici >> 16, txpici & 0xffff);
+	device_printf(sc->dev, "tbrdma ringregs: RX%u BASE0=0x%08x VALID=%u "
+	    "E2E=%u e2e_hopid=%u | PICI=0x%08x (pi=%u ci=%u)\n", rxring, rxb0,
+	    (rxb0 & RX_TABLE_VALID) ? 1 : 0, (rxb0 & RX_TABLE_E2E) ? 1 : 0,
+	    (rxb0 & RX_TABLE_E2E_HOPID_MASK) >> RX_TABLE_E2E_HOPID_SHIFT,
+	    rxpici, rxpici >> 16, rxpici & 0xffff);
 }
 
 int
