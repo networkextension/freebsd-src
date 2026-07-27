@@ -17,4 +17,8 @@ int tb_icm_init(struct nhi_softc *nsc, struct nhi_ring_pair *ring0,
     struct tb_icm **icmp);
 void tb_icm_fini(struct tb_icm *icm);
 
+/* Hotplug hints from hcm(4): a port went down / a plug happened (#70). */
+void tb_icm_link_down(struct tb_icm *icm);
+void tb_icm_link_up_hint(struct tb_icm *icm);
+
 #endif /* _TB_ICM_H_ */
