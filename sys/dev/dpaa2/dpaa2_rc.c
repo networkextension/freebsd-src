@@ -3193,6 +3193,14 @@ dpaa2_rc_ioctl(struct cdev *cdev, u_long ucmd, caddr_t data, int fflag,
 	if (sc == NULL)
 		return (ENXIO);
 
+	/*
+	 * device_add_child(), bus_attach_children() and device_delete_child()
+	 * all assert the newbus topology lock.  The device attach path holds it
+	 * implicitly; this control path is entered from a syscall, so it has to
+	 * take the lock itself.
+	 */
+	bus_topo_lock();
+
 	switch (ucmd) {
 	case DPAA2IOC_ADDNI: {
 		struct dpaa2_addni_args *a = (struct dpaa2_addni_args *) data;
@@ -3212,6 +3220,9 @@ dpaa2_rc_ioctl(struct cdev *cdev, u_long ucmd, caddr_t data, int fflag,
 		error = ENOTTY;
 		break;
 	}
+
+	bus_topo_unlock();
+
 	return (error);
 }
 
