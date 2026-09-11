@@ -79,6 +79,7 @@
 #include <dev/mii/mii.h>
 #include <dev/mii/miivar.h>
 #include <dev/mdio/mdio.h>
+#include <dev/sff/sff.h>
 
 #include "opt_acpi.h"
 #include "opt_platform.h"
@@ -95,6 +96,7 @@
 #include "dpaa2_swp.h"
 #include "dpaa2_swp_if.h"
 #include "dpaa2_cmd_if.h"
+#include "sff_if.h"
 #include "dpaa2_ni.h"
 #include "dpaa2_channel.h"
 #include "dpaa2_buf.h"
@@ -2708,44 +2710,163 @@ dpaa2_ni_qflush(if_t ifp)
 	if_qflush(ifp);
 }
 
+/*
+ * SFP+ EEPROM access for SIOCGI2C, so "ifconfig -v <dpni>" can show the
+ * module's SFF-8472 identity and diagnostics.  The module EEPROM lives on an
+ * i2c bus reached in one of two ways:
+ *
+ *  - FDT: the DPMAC's device-tree node has an "sfp" phandle to an "sff,sfp"
+ *    node handled by sff(4).  DPAA2_MC_GET_SFF_DEV() returns that device and
+ *    SFF_READ_EEPROM() performs the read (the i2c mux, if any, is switched
+ *    transparently by the i2c framework).
+ *
+ *  - ACPI: firmware exposes no such association, so it is supplied per
+ *    interface by loader tunables and any i2c mux is switched explicitly via
+ *    the sff(4) helper sff_read_eeprom():
+ *      hw.dpaa2.dpni<unit>.sfp_bus    iicbus unit (e.g. 0 for iic0); <0 disabled
+ *      hw.dpaa2.dpni<unit>.sfp_mux    7-bit i2c mux address (e.g. 0x77); 0 none
+ *      hw.dpaa2.dpni<unit>.sfp_chan   mux channel the cage sits on
+ *      hw.dpaa2.dpni<unit>.sfp_type   0 = PCA9547 (sel 0x08|ch), 1 = PCA9548
+ */
+#define	DPAA2_SFP_MUX_9547	0
+#define	DPAA2_SFP_MUX_9548	1
+
+static int
+dpaa2_ni_sfp_ioctl(struct dpaa2_ni_softc *sc, struct ifreq *ifr)
+{
+	struct ifi2creq req;
+	device_t sffdev = NULL, requester;
+	char tname[64];
+	int unit, busunit, mux, chan, type, error;
+	uint8_t chsel, chrestore;
+
+	error = copyin(ifr_data_get_ptr(ifr), &req, sizeof(req));
+	if (error != 0)
+		return (error);
+	if (req.dev_addr != 0xa0 && req.dev_addr != 0xa2)
+		return (EINVAL);
+	if (req.len == 0 || req.len > (int)sizeof(req.data))
+		return (EINVAL);
+	if ((u_int)req.offset + req.len > 256)
+		return (EINVAL);
+
+	/*
+	 * Primary path: the DPMAC's device tree names an sff,sfp device; let
+	 * sff(4) do the read (it switches the i2c mux transparently).
+	 */
+	if (DPAA2_MC_GET_SFF_DEV(sc->dev, &sffdev, sc->mac.dpmac_id) == 0 &&
+	    sffdev != NULL) {
+		error = SFF_READ_EEPROM(sffdev, req.dev_addr, req.offset,
+		    req.data, req.len);
+		if (error != 0)
+			return (error);
+		return (copyout(&req, ifr_data_get_ptr(ifr), sizeof(req)));
+	}
+
+	/*
+	 * Fallback: no sff,sfp device (e.g. ACPI boot).  Take the association
+	 * from the per-interface loader tunables and drive the mux explicitly
+	 * via the sff(4) helper.
+	 */
+	busunit = -1;
+	mux = 0;
+	chan = 0;
+	type = DPAA2_SFP_MUX_9547;
+	unit = device_get_unit(sc->dev);
+	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_bus", unit);
+	TUNABLE_INT_FETCH(tname, &busunit);
+	if (busunit < 0)
+		return (ENXIO);
+	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_mux", unit);
+	TUNABLE_INT_FETCH(tname, &mux);
+	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_chan", unit);
+	TUNABLE_INT_FETCH(tname, &chan);
+	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_type", unit);
+	TUNABLE_INT_FETCH(tname, &type);
+
+	requester = devclass_get_device(devclass_find("iic"), busunit);
+	if (requester == NULL)
+		return (ENXIO);
+	if (type == DPAA2_SFP_MUX_9548) {
+		chsel = (uint8_t)(1u << (chan & 0x07));
+		chrestore = 0x00;			/* all channels off */
+	} else {
+		chsel = (uint8_t)(0x08 | (chan & 0x07));	/* 9547 enable|ch */
+		chrestore = 0x08;			/* power-on value (ch0) */
+	}
+
+	error = sff_read_eeprom(requester, mux, chsel, chrestore,
+	    req.dev_addr, req.offset, req.data, req.len);
+	if (error != 0)
+		return (error);
+
+	return (copyout(&req, ifr_data_get_ptr(ifr), sizeof(req)));
+}
+
+/*
+ * Open/close the resource container (RC) and network interface (NI) MC objects.
+ * Only ioctls that actually issue MC commands need these, so they are opened on
+ * demand rather than around the whole switch.
+ */
+static int
+dpaa2_ni_cmd_open(struct dpaa2_ni_softc *sc, struct dpaa2_cmd *cmd,
+    uint16_t *rc_token, uint16_t *ni_token)
+{
+	device_t pdev = device_get_parent(sc->dev);
+	device_t dev = sc->dev;
+	struct dpaa2_devinfo *rcinfo = device_get_ivars(pdev);
+	struct dpaa2_devinfo *dinfo = device_get_ivars(dev);
+	int error;
+
+	DPAA2_CMD_INIT(cmd);
+
+	error = DPAA2_CMD_RC_OPEN(dev, dev, cmd, rcinfo->id, rc_token);
+	if (error) {
+		device_printf(dev, "%s: failed to open resource container: "
+		    "id=%d, error=%d\n", __func__, rcinfo->id, error);
+		return (error);
+	}
+	error = DPAA2_CMD_NI_OPEN(dev, dev, cmd, dinfo->id, ni_token);
+	if (error) {
+		device_printf(dev, "%s: failed to open network interface: "
+		    "id=%d, error=%d\n", __func__, dinfo->id, error);
+		(void)DPAA2_CMD_RC_CLOSE(dev, dev, DPAA2_CMD_TK(cmd, *rc_token));
+		return (error);
+	}
+	return (0);
+}
+
+static void
+dpaa2_ni_cmd_close(struct dpaa2_ni_softc *sc, struct dpaa2_cmd *cmd,
+    uint16_t rc_token, uint16_t ni_token)
+{
+	device_t dev = sc->dev;
+
+	(void)DPAA2_CMD_NI_CLOSE(dev, dev, DPAA2_CMD_TK(cmd, ni_token));
+	(void)DPAA2_CMD_RC_CLOSE(dev, dev, DPAA2_CMD_TK(cmd, rc_token));
+}
+
 static int
 dpaa2_ni_ioctl(if_t ifp, u_long c, caddr_t data)
 {
 	struct dpaa2_ni_softc *sc = if_getsoftc(ifp);
 	struct ifreq *ifr = (struct ifreq *) data;
-	device_t pdev = device_get_parent(sc->dev);
 	device_t dev = sc->dev;
-	device_t child = dev;
-	struct dpaa2_devinfo *rcinfo = device_get_ivars(pdev);
-	struct dpaa2_devinfo *dinfo = device_get_ivars(dev);
-	struct dpaa2_cmd cmd;
 	uint32_t changed = 0;
-	uint16_t rc_token, ni_token;
-	int mtu, error, rc = 0;
-
-	DPAA2_CMD_INIT(&cmd);
-
-	error = DPAA2_CMD_RC_OPEN(dev, child, &cmd, rcinfo->id, &rc_token);
-	if (error) {
-		device_printf(dev, "%s: failed to open resource container: "
-		    "id=%d, error=%d\n", __func__, rcinfo->id, error);
-		goto err_exit;
-	}
-	error = DPAA2_CMD_NI_OPEN(dev, child, &cmd, dinfo->id, &ni_token);
-	if (error) {
-		device_printf(dev, "%s: failed to open network interface: "
-		    "id=%d, error=%d\n", __func__, dinfo->id, error);
-		goto close_rc;
-	}
+	int rc = 0;
 
 	switch (c) {
-	case SIOCSIFMTU:
+	case SIOCSIFMTU: {
+		struct dpaa2_cmd cmd;
+		uint16_t rc_token, ni_token;
+		int mtu;
+
 		DPNI_LOCK(sc);
 		mtu = ifr->ifr_mtu;
 		if (mtu < ETHERMIN || mtu > ETHERMTU_JUMBO) {
 			DPNI_UNLOCK(sc);
-			error = EINVAL;
-			goto close_ni;
+			rc = EINVAL;
+			break;
 		}
 		if_setmtu(ifp, mtu);
 		DPNI_UNLOCK(sc);
@@ -2754,12 +2875,20 @@ dpaa2_ni_ioctl(if_t ifp, u_long c, caddr_t data)
 		mtu += ETHER_HDR_LEN;
 		if (if_getcapenable(ifp) & IFCAP_VLAN_MTU)
 			mtu += ETHER_VLAN_ENCAP_LEN;
-		error = DPAA2_CMD_NI_SET_MFL(dev, child, &cmd, mtu);
-		if (error) {
+
+		rc = dpaa2_ni_cmd_open(sc, &cmd, &rc_token, &ni_token);
+		if (rc != 0)
+			break;
+		rc = DPAA2_CMD_NI_SET_MFL(dev, dev, &cmd, mtu);
+		if (rc != 0)
 			device_printf(dev, "%s: failed to update maximum frame "
-			    "length: error=%d\n", __func__, error);
-			goto close_ni;
-		}
+			    "length: error=%d\n", __func__, rc);
+		dpaa2_ni_cmd_close(sc, &cmd, rc_token, ni_token);
+		break;
+	}
+	case SIOCGI2C:
+		/* SFP+ EEPROM access -- talks to an i2c bus, not the MC. */
+		rc = dpaa2_ni_sfp_ioctl(sc, ifr);
 		break;
 	case SIOCSIFCAP:
 		changed = if_getcapenable(ifp) ^ ifr->ifr_reqcap;
@@ -2825,16 +2954,7 @@ dpaa2_ni_ioctl(if_t ifp, u_long c, caddr_t data)
 		break;
 	}
 
-	(void)DPAA2_CMD_NI_CLOSE(dev, child, DPAA2_CMD_TK(&cmd, ni_token));
-	(void)DPAA2_CMD_RC_CLOSE(dev, child, DPAA2_CMD_TK(&cmd, rc_token));
 	return (rc);
-
-close_ni:
-	(void)DPAA2_CMD_NI_CLOSE(dev, child, DPAA2_CMD_TK(&cmd, ni_token));
-close_rc:
-	(void)DPAA2_CMD_RC_CLOSE(dev, child, DPAA2_CMD_TK(&cmd, rc_token));
-err_exit:
-	return (error);
 }
 
 static int
@@ -4027,6 +4147,7 @@ DRIVER_MODULE(miibus, dpaa2_ni, miibus_driver, 0, 0);
 DRIVER_MODULE(dpaa2_ni, dpaa2_rc, dpaa2_ni_driver, 0, 0);
 
 MODULE_DEPEND(dpaa2_ni, miibus, 1, 1, 1);
+MODULE_DEPEND(dpaa2_ni, sff, 1, 1, 1);
 #ifdef DEV_ACPI
 MODULE_DEPEND(dpaa2_ni, memac_mdio_acpi, 1, 1, 1);
 #endif

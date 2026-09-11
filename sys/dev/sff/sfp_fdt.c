@@ -38,6 +38,7 @@
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/fdt/simplebus.h>
 
+#include "sff.h"
 #include "sff_if.h"
 
 struct sfp_fdt_softc {
@@ -134,6 +135,30 @@ sfp_fdt_get_i2c_bus(device_t dev, device_t *i2c_bus)
 	return (0);
 }
 
+static int
+sfp_fdt_read_eeprom(device_t dev, uint8_t dev_addr, uint8_t offset,
+    uint8_t *buf, int len)
+{
+	device_t i2c_bus, requester;
+	int error;
+
+	error = sfp_fdt_get_i2c_bus(dev, &i2c_bus);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * The "i2c-bus" phandle points at the (possibly muxed) iicbus the
+	 * module EEPROM sits on; any i2c mux is switched transparently by the
+	 * i2c framework, so we just need a device on that bus to drive the
+	 * transfer (no explicit channel select).
+	 */
+	requester = device_find_child(i2c_bus, "iic", -1);
+	if (requester == NULL)
+		return (ENXIO);
+
+	return (sff_read_eeprom(requester, 0, 0, 0, dev_addr, offset, buf, len));
+}
+
 static device_method_t sfp_fdt_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		sfp_fdt_probe),
@@ -141,6 +166,7 @@ static device_method_t sfp_fdt_methods[] = {
 
 	/* SFF */
 	DEVMETHOD(sff_get_i2c_bus,	sfp_fdt_get_i2c_bus),
+	DEVMETHOD(sff_read_eeprom,	sfp_fdt_read_eeprom),
 
 	DEVMETHOD_END
 };
