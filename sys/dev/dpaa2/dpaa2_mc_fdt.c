@@ -193,6 +193,27 @@ dpaa2_mac_fdt_get_phy_dev(device_t dev)
 	return (OF_device_from_xref(OF_xref_from_node(sc->phy_handle)));
 }
 
+/*
+ * Resolve the "sff,sfp" device for this DPMAC from the "sfp" phandle parsed at
+ * attach.  The sff(4) driver (sfp_fdt) registers itself by the referenced node's
+ * xref, so a simple xref lookup yields its device_t.  Returns NULL if the DPMAC
+ * has no SFP association or the sff device is not (yet) attached.
+ */
+static device_t
+dpaa2_mac_fdt_get_sff_dev(device_t dev)
+{
+	struct dpaa2_mac_fdt_softc *sc;
+
+	if (dev == NULL)
+		return (NULL);
+
+	sc = device_get_softc(dev);
+	if (sc->sfp == 0)
+		return (NULL);
+
+	return (OF_device_from_xref(OF_xref_from_node(sc->sfp)));
+}
+
 static device_method_t dpaa2_mac_fdt_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		dpaa2_mac_dev_probe),
@@ -342,6 +363,30 @@ dpaa2_mc_fdt_get_phy_dev(device_t dev, device_t *phy_dev, uint32_t id)
 	return (0);
 }
 
+static int
+dpaa2_mc_fdt_get_sff_dev(device_t dev, device_t *sff_dev, uint32_t id)
+{
+	device_t mdev, sffdev;
+
+	mdev = dpaa2_mc_fdt_find_dpaa2_mac_dev(dev, id);
+	if (mdev == NULL)
+		return (ENXIO);
+
+	sffdev = dpaa2_mac_fdt_get_sff_dev(mdev);
+	if (sffdev == NULL)
+		return (ENXIO);
+
+	if (sff_dev != NULL)
+		*sff_dev = sffdev;
+
+	if (bootverbose)
+		device_printf(dev, "dpmac_id %u mdev %s sff dev %s\n",
+		    id, device_get_nameunit(mdev),
+		    device_get_nameunit(sffdev));
+
+	return (0);
+}
+
 static const struct ofw_bus_devinfo *
 dpaa2_mc_simplebus_get_devinfo(device_t bus, device_t child)
 {
@@ -379,6 +424,7 @@ static device_method_t dpaa2_mc_fdt_methods[] = {
 	DEVMETHOD(dpaa2_mc_reserve_dev,	dpaa2_mc_reserve_dev),
 	DEVMETHOD(dpaa2_mc_release_dev, dpaa2_mc_release_dev),
 	DEVMETHOD(dpaa2_mc_get_phy_dev,	dpaa2_mc_fdt_get_phy_dev),
+	DEVMETHOD(dpaa2_mc_get_sff_dev,	dpaa2_mc_fdt_get_sff_dev),
 
 	/* OFW/simplebus */
 	DEVMETHOD(ofw_bus_get_devinfo,	dpaa2_mc_simplebus_get_devinfo),

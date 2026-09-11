@@ -106,6 +106,15 @@ CODE {
 			    phy_dev, id));
 		return (ENXIO);
 	}
+
+	static int
+	bypass_get_sff_dev(device_t dev, device_t *sff_dev, uint32_t id)
+	{
+		if (device_get_parent(dev) != NULL)
+			return (DPAA2_MC_GET_SFF_DEV(device_get_parent(dev),
+			    sff_dev, id));
+		return (ENXIO);
+	}
 }
 
 METHOD int manage_dev {
@@ -150,3 +159,24 @@ METHOD int get_phy_dev {
 	device_t	 *phy_dev;
 	uint32_t	 id;
 } DEFAULT bypass_get_phy_dev;
+
+/**
+ * @brief Look up the "sff,sfp" device associated with a DPMAC.
+ *
+ * Resolved from the "sfp" phandle in the DPMAC's device-tree node; the sff(4)
+ * driver registers itself by that node's xref.  Implemented on the FDT compat
+ * layer only: under ACPI the firmware describes no such association.
+ *
+ * @param dev		requesting device; walked up to the MC bus
+ * @param sff_dev	filled in with the sff,sfp transceiver device, on which
+ *			SFF_READ_EEPROM() may then be called
+ * @param id		DPMAC object id
+ *
+ * @returns		0 on success and *sff_dev set; ENXIO if the DPMAC has
+ *			no "sfp" phandle, or on a non-FDT (ACPI) system
+ */
+METHOD int get_sff_dev {
+	device_t	 dev;
+	device_t	 *sff_dev;
+	uint32_t	 id;
+} DEFAULT bypass_get_sff_dev;
