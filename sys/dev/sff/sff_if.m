@@ -29,7 +29,42 @@
 
 INTERFACE sff;
 
+#
+# A transceiver front-end need not implement every method: a platform may be
+# able to read the EEPROM but have no way to reach the module's control lines,
+# or the reverse.  kobj(9) turns an unimplemented method without a DEFAULT into
+# a panic, so give both of them one that simply says "not here".
+#
+CODE {
+	static int
+	null_get_i2c_bus(device_t dev, device_t *i2c_bus)
+	{
+
+		return (ENXIO);
+	}
+
+	static int
+	null_read_eeprom(device_t dev, uint8_t dev_addr, uint8_t offset,
+	    uint8_t *buf, int len)
+	{
+
+		return (ENXIO);
+	}
+};
+
 METHOD int get_i2c_bus {
 	device_t		 dev;
 	device_t		*i2c_bus;
-};
+} DEFAULT null_get_i2c_bus;
+
+#
+# Read from an SFP module EEPROM page (dev_addr is the 8-bit page address,
+# e.g. 0xA0 base / 0xA2 diagnostics) starting at the given byte offset.
+#
+METHOD int read_eeprom {
+	device_t		 dev;
+	uint8_t			 dev_addr;
+	uint8_t			 offset;
+	uint8_t			*buf;
+	int			 len;
+} DEFAULT null_read_eeprom;
