@@ -2076,6 +2076,16 @@ acpi_bus_get_prop(device_t bus, device_t child, const char *propname,
 	ACPI_STATUS status;
 	const ACPI_OBJECT *obj;
 
+	/*
+	 * acpi_device_get_prop() reads the child's ivars as a struct
+	 * acpi_device.  That only holds for our own children: buses that do
+	 * not implement BUS_GET_PROPERTY themselves forward the request up
+	 * with the original child, whose ivars belong to that bus and have a
+	 * completely different layout.  Reading them as ours faults.
+	 */
+	if (device_get_parent(child) != bus)
+		return (-1);
+
 	status = acpi_device_get_prop(bus, child, propname, &obj);
 	if (ACPI_FAILURE(status))
 		return (-1);
