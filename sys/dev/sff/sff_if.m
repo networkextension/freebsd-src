@@ -25,11 +25,43 @@
 # SUCH DAMAGE.
 #
 
+#include <sys/errno.h>
+
 #include <machine/bus.h>
 
 INTERFACE sff;
 
+CODE {
+	static int
+	null_get_i2c_bus(device_t dev __unused, device_t *i2c_bus __unused)
+	{
+		return (ENXIO);
+	}
+
+	static int
+	null_read_eeprom(device_t dev __unused, uint8_t dev_addr __unused,
+	    uint8_t offset __unused, uint8_t *buf __unused, int len __unused)
+	{
+		return (ENXIO);
+	}
+};
+
+#
+# Return the iicbus the module EEPROM is reachable on.
+#
 METHOD int get_i2c_bus {
 	device_t		 dev;
 	device_t		*i2c_bus;
-};
+} DEFAULT null_get_i2c_bus;
+
+#
+# Read from an SFP module EEPROM page (dev_addr is the 8-bit page address,
+# e.g. 0xA0 base / 0xA2 diagnostics) starting at the given byte offset.
+#
+METHOD int read_eeprom {
+	device_t		 dev;
+	uint8_t			 dev_addr;
+	uint8_t			 offset;
+	uint8_t			*buf;
+	int			 len;
+} DEFAULT null_read_eeprom;

@@ -1,0 +1,104 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Xiangbo Kong <yarshure@gmail.com>
+ */
+
+/*
+ * Small Form Factor (SFF) Committee Pluggable (SFP) Transceiver: shared i2c
+ * helpers used by the bus-specific front-ends (sfp_fdt, ...) and by NIC drivers
+ * that must drive an i2c mux themselves.
+ */
+
+#include <sys/param.h>
+#include <sys/kernel.h>
+#include <sys/bus.h>
+#include <sys/module.h>
+
+#include <dev/iicbus/iic.h>
+#include <dev/iicbus/iiconf.h>
+
+#include "sff.h"
+
+/*
+ * Find a device on an iicbus that can own a bus request.  The i2c framework
+ * requires a device_t on the target bus to arbitrate transfers; iic(4) is the
+ * generic child that every iicbus carries for that purpose.
+ */
+device_t
+sff_i2c_requester(device_t i2c_bus)
+{
+	if (i2c_bus == NULL)
+		return (NULL);
+
+	return (device_find_child(i2c_bus, "iic", DEVICE_UNIT_ANY));
+}
+
+int
+sff_read_eeprom(device_t requester, int muxaddr, uint8_t chsel,
+    uint8_t chrestore, uint8_t dev_addr, uint8_t offset, uint8_t *buf, int len)
+{
+	device_t bus = device_get_parent(requester);
+	struct iic_msg sel, rd[2];
+	uint8_t off = offset;
+	int error;
+
+	/*
+	 * Hold the bus across the (optional) mux channel select, the offset
+	 * write and the data read, so no other consumer can switch the mux or
+	 * see it pointed at this device mid-transaction.
+	 */
+	error = iicbus_request_bus(bus, requester, IIC_INTRWAIT);
+	if (error != 0)
+		return (iic2errno(error));
+
+	if (muxaddr != 0) {
+		sel.slave = (uint16_t)muxaddr << 1;
+		sel.flags = IIC_M_WR;
+		sel.len = 1;
+		sel.buf = &chsel;
+		error = iicbus_transfer(requester, &sel, 1);
+	}
+
+	if (error == 0) {
+		/* Write the byte offset (repeat-start), then read the data. */
+		rd[0].slave = dev_addr;		/* already 8-bit (0xA0/0xA2) */
+		rd[0].flags = IIC_M_WR | IIC_M_NOSTOP;
+		rd[0].len = 1;
+		rd[0].buf = &off;
+		rd[1].slave = dev_addr;
+		rd[1].flags = IIC_M_RD;
+		rd[1].len = len;
+		rd[1].buf = buf;
+		error = iicbus_transfer(requester, rd, 2);
+	}
+
+	if (muxaddr != 0) {
+		sel.slave = (uint16_t)muxaddr << 1;
+		sel.flags = IIC_M_WR;
+		sel.len = 1;
+		sel.buf = &chrestore;
+		(void)iicbus_transfer(requester, &sel, 1);
+	}
+
+	iicbus_release_bus(bus, requester);
+	return (error != 0 ? iic2errno(error) : 0);
+}
+
+static int
+sff_modevent(module_t mod __unused, int type, void *data __unused)
+{
+	switch (type) {
+	case MOD_LOAD:
+	case MOD_UNLOAD:
+	case MOD_QUIESCE:
+		return (0);
+	default:
+		return (EOPNOTSUPP);
+	}
+}
+
+static moduledata_t sff_moduledata = { "sff", sff_modevent, NULL };
+DECLARE_MODULE(sff, sff_moduledata, SI_SUB_DRIVERS, SI_ORDER_ANY);
+MODULE_VERSION(sff, 1);
+MODULE_DEPEND(sff, iicbus, IICBUS_MINVER, IICBUS_PREFVER, IICBUS_MAXVER);

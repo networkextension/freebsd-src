@@ -19,6 +19,11 @@ SRCS+=	dpaa2_frame.c
 SRCS+=	dpaa2_cmd_if.c dpaa2_cmd_if.h
 SRCS+=	dpaa2_swp_if.c dpaa2_swp_if.h
 SRCS+=	dpaa2_mc_if.c dpaa2_mc_if.h
+#
+# sff_if.h only: sff_if.c is built into sff.ko, and adding it here would
+# duplicate the kobj method descriptors in two modules.
+#
+SRCS+=	sff_if.h
 SRCS+=	memac_mdio_common.c memac_mdio_if.c memac_mdio_if.h
 
 SRCS+=	dpaa2_console.c
