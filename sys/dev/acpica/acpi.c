@@ -164,7 +164,8 @@ static uint32_t	acpi_isa_get_logicalid(device_t dev);
 static int	acpi_isa_get_compatid(device_t dev, uint32_t *cids, int count);
 static ACPI_STATUS acpi_device_scan_cb(ACPI_HANDLE h, UINT32 level,
 		    void *context, void **retval);
-static ACPI_STATUS acpi_find_dsd(struct acpi_device *ad);
+static ACPI_STATUS acpi_find_dsd(ACPI_HANDLE h, ACPI_BUFFER *dsd,
+		    const ACPI_OBJECT **dsd_pkg);
 static void	acpi_platform_osc(device_t dev);
 static void	acpi_probe_children(device_t bus);
 static void	acpi_probe_order(ACPI_HANDLE handle, int *order);
@@ -1967,30 +1968,52 @@ acpi_device_eval_obj(device_t bus, device_t dev, const char *pathname,
 }
 
 static ACPI_STATUS
-acpi_device_get_prop(device_t bus, device_t dev, const char *propname,
+acpi_find_dsd(ACPI_HANDLE h, ACPI_BUFFER *dsd, const ACPI_OBJECT **dsd_pkg)
+{
+	const ACPI_OBJECT *obj, *guid, *pkg;
+	ACPI_STATUS status;
+
+	dsd->Length = ACPI_ALLOCATE_BUFFER;
+	dsd->Pointer = NULL;
+	*dsd_pkg = NULL;
+
+	status = AcpiEvaluateObject(h, "_DSD", NULL, dsd);
+	if (ACPI_FAILURE(status))
+		return (status);
+
+	obj = dsd->Pointer;
+	if (obj->Type != ACPI_TYPE_PACKAGE || obj->Package.Count < 2)
+		return (AE_NOT_FOUND);
+
+	guid = &obj->Package.Elements[0];
+	pkg = &obj->Package.Elements[1];
+
+	if (guid->Type != ACPI_TYPE_BUFFER || pkg->Type != ACPI_TYPE_PACKAGE ||
+		guid->Buffer.Length != sizeof(acpi_dsd_uuid))
+		return (AE_NOT_FOUND);
+	if (memcmp(guid->Buffer.Pointer, &acpi_dsd_uuid,
+		sizeof(acpi_dsd_uuid)) == 0) {
+
+		*dsd_pkg = pkg;
+		return (AE_OK);
+	}
+
+	return (AE_NOT_FOUND);
+}
+
+/*
+ * Find a named property in an already located _DSD property package.  The
+ * value points into the _DSD buffer and is only valid while that buffer is.
+ */
+static ACPI_STATUS
+acpi_dsd_lookup(const ACPI_OBJECT *dsd_pkg, const char *propname,
     const ACPI_OBJECT **value)
 {
 	const ACPI_OBJECT *pkg, *name, *val;
-	struct acpi_device *ad;
-	ACPI_STATUS status;
 	int i;
 
-	ad = device_get_ivars(dev);
-
-	if (ad == NULL || propname == NULL)
-		return (AE_BAD_PARAMETER);
-	if (ad->dsd_pkg == NULL) {
-		if (ad->dsd.Pointer == NULL) {
-			status = acpi_find_dsd(ad);
-			if (ACPI_FAILURE(status))
-				return (status);
-		} else {
-			return (AE_NOT_FOUND);
-		}
-	}
-
-	for (i = 0; i < ad->dsd_pkg->Package.Count; i ++) {
-		pkg = &ad->dsd_pkg->Package.Elements[i];
+	for (i = 0; i < dsd_pkg->Package.Count; i ++) {
+		pkg = &dsd_pkg->Package.Elements[i];
 		if (pkg->Type != ACPI_TYPE_PACKAGE || pkg->Package.Count != 2)
 			continue;
 
@@ -2010,34 +2033,28 @@ acpi_device_get_prop(device_t bus, device_t dev, const char *propname,
 }
 
 static ACPI_STATUS
-acpi_find_dsd(struct acpi_device *ad)
+acpi_device_get_prop(device_t bus, device_t dev, const char *propname,
+    const ACPI_OBJECT **value)
 {
-	const ACPI_OBJECT *dsd, *guid, *pkg;
+	struct acpi_device *ad;
 	ACPI_STATUS status;
 
-	ad->dsd.Length = ACPI_ALLOCATE_BUFFER;
-	ad->dsd.Pointer = NULL;
-	ad->dsd_pkg = NULL;
+	ad = device_get_ivars(dev);
 
-	status = AcpiEvaluateObject(ad->ad_handle, "_DSD", NULL, &ad->dsd);
-	if (ACPI_FAILURE(status))
-		return (status);
-
-	dsd = ad->dsd.Pointer;
-	guid = &dsd->Package.Elements[0];
-	pkg = &dsd->Package.Elements[1];
-
-	if (guid->Type != ACPI_TYPE_BUFFER || pkg->Type != ACPI_TYPE_PACKAGE ||
-		guid->Buffer.Length != sizeof(acpi_dsd_uuid))
-		return (AE_NOT_FOUND);
-	if (memcmp(guid->Buffer.Pointer, &acpi_dsd_uuid,
-		sizeof(acpi_dsd_uuid)) == 0) {
-
-		ad->dsd_pkg = pkg;
-		return (AE_OK);
+	if (ad == NULL || propname == NULL)
+		return (AE_BAD_PARAMETER);
+	if (ad->dsd_pkg == NULL) {
+		if (ad->dsd.Pointer == NULL) {
+			status = acpi_find_dsd(ad->ad_handle, &ad->dsd,
+			    &ad->dsd_pkg);
+			if (ACPI_FAILURE(status))
+				return (status);
+		} else {
+			return (AE_NOT_FOUND);
+		}
 	}
 
-	return (AE_NOT_FOUND);
+	return (acpi_dsd_lookup(ad->dsd_pkg, propname, value));
 }
 
 static ssize_t
@@ -2069,27 +2086,13 @@ err:
 	return (-1);
 }
 
+/*
+ * Render a _DSD property value as the type the caller asked for.
+ */
 static ssize_t
-acpi_bus_get_prop(device_t bus, device_t child, const char *propname,
-    void *propvalue, size_t size, device_property_type_t type)
+acpi_bus_prop_value(const ACPI_OBJECT *obj, void *propvalue, size_t size,
+    device_property_type_t type)
 {
-	ACPI_STATUS status;
-	const ACPI_OBJECT *obj;
-
-	/*
-	 * acpi_device_get_prop() reads the child's ivars as a struct
-	 * acpi_device.  That only holds for our own children: buses that do
-	 * not implement BUS_GET_PROPERTY themselves forward the request up
-	 * with the original child, whose ivars belong to that bus and have a
-	 * completely different layout.  Reading them as ours faults.
-	 */
-	if (device_get_parent(child) != bus)
-		return (-1);
-
-	status = acpi_device_get_prop(bus, child, propname, &obj);
-	if (ACPI_FAILURE(status))
-		return (-1);
-
 	switch (type) {
 	case DEVICE_PROP_ANY:
 	case DEVICE_PROP_BUFFER:
@@ -2141,12 +2144,67 @@ acpi_bus_get_prop(device_t bus, device_t child, const char *propname,
 
 			h = acpi_GetReference(NULL,
 			    __DECONST(ACPI_OBJECT *, obj));
-			memcpy(propvalue, h, sizeof(ACPI_HANDLE));
+			memcpy(propvalue, &h, sizeof(ACPI_HANDLE));
 		}
 		return (sizeof(ACPI_HANDLE));
 	default:
 		return (0);
 	}
+}
+
+/*
+ * Read a property from the _DSD of the object named by a handle.
+ *
+ * The _DSD package is freed before returning, so a property whose value would
+ * be handed back by reference into it -- a sub-package -- cannot be served
+ * this way.  DEVICE_PROP_HANDLE can: it resolves the reference to a namespace
+ * handle, which outlives the buffer.
+ */
+static ssize_t
+acpi_handle_get_prop(ACPI_HANDLE h, const char *propname, void *propvalue,
+    size_t size, device_property_type_t type)
+{
+	const ACPI_OBJECT *dsd_pkg, *obj;
+	ACPI_BUFFER dsd;
+	ssize_t ret;
+
+	ret = -1;
+	if (ACPI_FAILURE(acpi_find_dsd(h, &dsd, &dsd_pkg)))
+		goto out;
+	if (ACPI_FAILURE(acpi_dsd_lookup(dsd_pkg, propname, &obj)))
+		goto out;
+	if (obj->Type == ACPI_TYPE_PACKAGE && type != DEVICE_PROP_HANDLE)
+		goto out;
+
+	ret = acpi_bus_prop_value(obj, propvalue, size, type);
+out:
+	if (dsd.Pointer != NULL)
+		AcpiOsFree(dsd.Pointer);
+	return (ret);
+}
+
+static ssize_t
+acpi_bus_get_prop(device_t bus, device_t child, const char *propname,
+    void *propvalue, size_t size, device_property_type_t type)
+{
+	ACPI_HANDLE h;
+
+	/*
+	 * Reach the child through its ACPI handle rather than through its
+	 * ivars.  A bus that does not implement this method forwards the
+	 * request up with the original child, and that child's ivars belong
+	 * to that bus: they are a struct acpi_device only where the bus went
+	 * out of its way to make them one.  An ACPI-described i2c bus keeps
+	 * its own layout and a miibus PHY has no ACPI ivars at all; reading
+	 * either as ours faults.  The handle comes through BUS_READ_IVAR
+	 * instead, which every bus answers for its own children or declines
+	 * -- and declining leaves it NULL, which is the right answer here.
+	 */
+	h = acpi_get_handle(child);
+	if (h == NULL)
+		return (-1);
+
+	return (acpi_handle_get_prop(h, propname, propvalue, size, type));
 }
 
 static int

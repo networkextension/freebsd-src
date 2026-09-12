@@ -67,6 +67,7 @@ struct dpaa2_mac_dev_softc {
 	char			phy_conn_type[64];
 	char			phy_mode[64];
 	ACPI_HANDLE		phy_channel;
+	ACPI_HANDLE		sfp;
 };
 
 static int
@@ -117,6 +118,8 @@ dpaa2_mac_dev_attach(device_t dev)
 	    sizeof(sc->phy_mode), DEVICE_PROP_ANY);
 	s = device_get_property(dev, "phy-handle", &sc->phy_channel,
 	    sizeof(sc->phy_channel), DEVICE_PROP_HANDLE);
+	s = device_get_property(dev, "sfp", &sc->sfp, sizeof(sc->sfp),
+	    DEVICE_PROP_HANDLE);
 
 	if (bootverbose)
 		device_printf(dev, "UID %#04x reg %#04jx managed '%s' "
@@ -125,6 +128,8 @@ dpaa2_mac_dev_attach(device_t dev)
 		    sc->phy_conn_type[0] != '\0' ? sc->phy_conn_type : "",
 		    sc->phy_mode[0] != '\0' ? sc->phy_mode : "",
 		    sc->phy_channel != NULL ? acpi_name(sc->phy_channel) : "");
+	if (bootverbose && sc->sfp != NULL)
+		device_printf(dev, "sfp '%s'\n", acpi_name(sc->sfp));
 
 	return (0);
 }
@@ -157,6 +162,27 @@ dpaa2_mac_dev_get_phy_dev(device_t dev)
 		return (NULL);
 
 	return (acpi_get_device(sc->phy_channel));
+}
+
+/*
+ * Resolve the "sff,sfp" device for this DPMAC from the "sfp" reference parsed
+ * at attach.  acpi_iicbus(4) attached the transceiver to its namespace node
+ * when it enumerated it, so acpi_get_device() yields its device_t -- the same
+ * shape as the FDT path's OF_device_from_xref().
+ */
+static device_t
+dpaa2_mac_dev_get_sff_dev(device_t dev)
+{
+	struct dpaa2_mac_dev_softc *sc;
+
+	if (dev == NULL)
+		return (NULL);
+
+	sc = device_get_softc(dev);
+	if (sc->sfp == NULL)
+		return (NULL);
+
+	return (acpi_get_device(sc->sfp));
 }
 
 static device_method_t dpaa2_mac_dev_methods[] = {
@@ -327,6 +353,30 @@ dpaa2_mc_acpi_get_phy_dev(device_t dev, device_t *phy_dev, uint32_t id)
 	return (0);
 }
 
+static int
+dpaa2_mc_acpi_get_sff_dev(device_t dev, device_t *sff_dev, uint32_t id)
+{
+	device_t mdev, sffdev;
+
+	mdev = dpaa2_mc_acpi_find_dpaa2_mac_dev(dev, id);
+	if (mdev == NULL)
+		return (ENXIO);
+
+	sffdev = dpaa2_mac_dev_get_sff_dev(mdev);
+	if (sffdev == NULL)
+		return (ENXIO);
+
+	if (sff_dev != NULL)
+		*sff_dev = sffdev;
+
+	if (bootverbose)
+		device_printf(dev, "dpmac_id %u mdev %s sff dev %s\n",
+		    id, device_get_nameunit(mdev),
+		    device_get_nameunit(sffdev));
+
+	return (0);
+}
+
 static ssize_t
 dpaa2_mc_acpi_get_property(device_t dev, device_t child, const char *propname,
     void *propvalue, size_t size, device_property_type_t type)
@@ -379,6 +429,7 @@ static device_method_t dpaa2_mc_acpi_methods[] = {
 	DEVMETHOD(dpaa2_mc_reserve_dev,	dpaa2_mc_reserve_dev),
 	DEVMETHOD(dpaa2_mc_release_dev, dpaa2_mc_release_dev),
 	DEVMETHOD(dpaa2_mc_get_phy_dev,	dpaa2_mc_acpi_get_phy_dev),
+	DEVMETHOD(dpaa2_mc_get_sff_dev,	dpaa2_mc_acpi_get_sff_dev),
 
 	/* ACPI compar layer. */
 	DEVMETHOD(bus_read_ivar,	dpaa2_mc_acpi_read_ivar),

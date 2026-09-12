@@ -92,6 +92,13 @@ sff_read_eeprom(device_t requester, int muxaddr, uint8_t chsel,
 	return (error != 0 ? iic2errno(error) : 0);
 }
 
+device_t
+sff_i2c_requester(device_t i2c_bus)
+{
+
+	return (device_find_child(i2c_bus, "iic", DEVICE_UNIT_ANY));
+}
+
 static int
 sff_modevent(module_t mod __unused, int type, void *data __unused)
 {

@@ -48,4 +48,11 @@ int	sff_read_eeprom(device_t requester, int muxaddr, uint8_t chsel,
 	    uint8_t chrestore, uint8_t dev_addr, uint8_t offset, uint8_t *buf,
 	    int len);
 
+/*
+ * A bus request needs an owner that sits on the bus being requested.  A
+ * transceiver front-end typically has only the iicbus itself, so borrow the
+ * iic(4) child every iicbus carries.  Returns NULL if there is none.
+ */
+device_t sff_i2c_requester(device_t i2c_bus);
+
 #endif /* _DEV_SFF_SFF_H_ */

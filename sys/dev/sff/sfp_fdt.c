@@ -152,7 +152,7 @@ sfp_fdt_read_eeprom(device_t dev, uint8_t dev_addr, uint8_t offset,
 	 * i2c framework, so we just need a device on that bus to drive the
 	 * transfer (no explicit channel select).
 	 */
-	requester = device_find_child(i2c_bus, "iic", -1);
+	requester = sff_i2c_requester(i2c_bus);
 	if (requester == NULL)
 		return (ENXIO);
 
@@ -178,3 +178,5 @@ EARLY_DRIVER_MODULE(sfp_fdt, simplebus, sfp_fdt_driver, 0, 0,
     BUS_PASS_SUPPORTDEV);
 EARLY_DRIVER_MODULE(sfp_fdt, ofwbus, sfp_fdt_driver, 0, 0,
     BUS_PASS_SUPPORTDEV);
+MODULE_VERSION(sfp_fdt, 1);
+MODULE_DEPEND(sfp_fdt, sff, 1, 1, 1);

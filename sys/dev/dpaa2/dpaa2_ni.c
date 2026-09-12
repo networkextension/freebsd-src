@@ -79,7 +79,6 @@
 #include <dev/mii/mii.h>
 #include <dev/mii/miivar.h>
 #include <dev/mdio/mdio.h>
-#include <dev/sff/sff.h>
 
 #include "opt_acpi.h"
 #include "opt_platform.h"
@@ -2712,33 +2711,20 @@ dpaa2_ni_qflush(if_t ifp)
 
 /*
  * SFP+ EEPROM access for SIOCGI2C, so "ifconfig -v <dpni>" can show the
- * module's SFF-8472 identity and diagnostics.  The module EEPROM lives on an
- * i2c bus reached in one of two ways:
+ * module's SFF-8472 identity and diagnostics.
  *
- *  - FDT: the DPMAC's device-tree node has an "sfp" phandle to an "sff,sfp"
- *    node handled by sff(4).  DPAA2_MC_GET_SFF_DEV() returns that device and
- *    SFF_READ_EEPROM() performs the read (the i2c mux, if any, is switched
- *    transparently by the i2c framework).
- *
- *  - ACPI: firmware exposes no such association, so it is supplied per
- *    interface by loader tunables and any i2c mux is switched explicitly via
- *    the sff(4) helper sff_read_eeprom():
- *      hw.dpaa2.dpni<unit>.sfp_bus    iicbus unit (e.g. 0 for iic0); <0 disabled
- *      hw.dpaa2.dpni<unit>.sfp_mux    7-bit i2c mux address (e.g. 0x77); 0 none
- *      hw.dpaa2.dpni<unit>.sfp_chan   mux channel the cage sits on
- *      hw.dpaa2.dpni<unit>.sfp_type   0 = PCA9547 (sel 0x08|ch), 1 = PCA9548
+ * The transceiver is a device in its own right: firmware names it in the
+ * DPMAC's node -- an "sfp" phandle under FDT, an "sfp" _DSD reference under
+ * ACPI -- and sff(4) drives it.  All this handler does is ask the MC bus for
+ * that device and read from it; it knows neither how the module is wired up
+ * nor which flavour of firmware described it.
  */
-#define	DPAA2_SFP_MUX_9547	0
-#define	DPAA2_SFP_MUX_9548	1
-
 static int
 dpaa2_ni_sfp_ioctl(struct dpaa2_ni_softc *sc, struct ifreq *ifr)
 {
 	struct ifi2creq req;
-	device_t sffdev = NULL, requester;
-	char tname[64];
-	int unit, busunit, mux, chan, type, error;
-	uint8_t chsel, chrestore;
+	device_t sffdev;
+	int error;
 
 	error = copyin(ifr_data_get_ptr(ifr), &req, sizeof(req));
 	if (error != 0)
@@ -2750,53 +2736,15 @@ dpaa2_ni_sfp_ioctl(struct dpaa2_ni_softc *sc, struct ifreq *ifr)
 	if ((u_int)req.offset + req.len > 256)
 		return (EINVAL);
 
-	/*
-	 * Primary path: the DPMAC's device tree names an sff,sfp device; let
-	 * sff(4) do the read (it switches the i2c mux transparently).
-	 */
-	if (DPAA2_MC_GET_SFF_DEV(sc->dev, &sffdev, sc->mac.dpmac_id) == 0 &&
-	    sffdev != NULL) {
-		error = SFF_READ_EEPROM(sffdev, req.dev_addr, req.offset,
-		    req.data, req.len);
-		if (error != 0)
-			return (error);
-		return (copyout(&req, ifr_data_get_ptr(ifr), sizeof(req)));
-	}
-
-	/*
-	 * Fallback: no sff,sfp device (e.g. ACPI boot).  Take the association
-	 * from the per-interface loader tunables and drive the mux explicitly
-	 * via the sff(4) helper.
-	 */
-	busunit = -1;
-	mux = 0;
-	chan = 0;
-	type = DPAA2_SFP_MUX_9547;
-	unit = device_get_unit(sc->dev);
-	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_bus", unit);
-	TUNABLE_INT_FETCH(tname, &busunit);
-	if (busunit < 0)
+	sffdev = NULL;
+	error = DPAA2_MC_GET_SFF_DEV(sc->dev, &sffdev, sc->mac.dpmac_id);
+	if (error != 0)
+		return (error);
+	if (sffdev == NULL)
 		return (ENXIO);
-	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_mux", unit);
-	TUNABLE_INT_FETCH(tname, &mux);
-	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_chan", unit);
-	TUNABLE_INT_FETCH(tname, &chan);
-	snprintf(tname, sizeof(tname), "hw.dpaa2.dpni%d.sfp_type", unit);
-	TUNABLE_INT_FETCH(tname, &type);
 
-	requester = devclass_get_device(devclass_find("iic"), busunit);
-	if (requester == NULL)
-		return (ENXIO);
-	if (type == DPAA2_SFP_MUX_9548) {
-		chsel = (uint8_t)(1u << (chan & 0x07));
-		chrestore = 0x00;			/* all channels off */
-	} else {
-		chsel = (uint8_t)(0x08 | (chan & 0x07));	/* 9547 enable|ch */
-		chrestore = 0x08;			/* power-on value (ch0) */
-	}
-
-	error = sff_read_eeprom(requester, mux, chsel, chrestore,
-	    req.dev_addr, req.offset, req.data, req.len);
+	error = SFF_READ_EEPROM(sffdev, req.dev_addr, req.offset, req.data,
+	    req.len);
 	if (error != 0)
 		return (error);
 

@@ -163,10 +163,11 @@ METHOD int get_phy_dev {
 /**
  * @brief Look up the "sff,sfp" device associated with a DPMAC.
  *
- * Resolved from the "sfp" phandle in the DPMAC's device-tree node (the sff(4)
- * driver registers itself by that node's xref). Only implemented on the FDT
- * compat layer; returns ENXIO under ACPI, where firmware provides no such
- * association.
+ * Resolved from the "sfp" reference in the DPMAC's firmware node: a phandle
+ * under FDT, a _DSD reference under ACPI.  Either way the sff(4) transceiver
+ * device is looked up from it, so the caller does not learn which of the two
+ * described the hardware.  Returns ENXIO when firmware names no transceiver
+ * for this DPMAC.
  *
  *   dev     - requesting device (walked up to the MC bus)
  *   sff_dev - the sff,sfp transceiver device (call SFF_READ_EEPROM() on it)
