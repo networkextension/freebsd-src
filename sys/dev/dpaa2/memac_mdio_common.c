@@ -268,7 +268,15 @@ int
 memac_mdio_read_ivar(device_t dev, device_t child, int index, uintptr_t *result)
 {
 
-	return (BUS_READ_IVAR(device_get_parent(dev), dev, index, result));
+	/*
+	 * Pass "child" up rather than "dev".  Our children are PHYs we added
+	 * ourselves from firmware nodes, and a request for one of them has to
+	 * reach our own parent still naming that PHY -- answering with our own
+	 * ivars hands out the MDIO bus's ACPI handle instead of the PHY's, so
+	 * the PHY reads the bus's _UID and _DSD and finds no "phy-channel".
+	 * dpaa2_mc(4) forwards the same way for the same reason.
+	 */
+	return (BUS_READ_IVAR(device_get_parent(dev), child, index, result));
 }
 
 
