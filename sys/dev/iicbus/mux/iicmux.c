@@ -139,7 +139,7 @@ iicmux_get_node(device_t dev, device_t child)
 		if (sc->childdevs[i] == child)
 			return (sc->childnodes[i]);
 	}
-	return (0); /* null handle */
+	return (-1); /* no node */
 }
 #endif
 
@@ -249,11 +249,14 @@ iicmux_attach_children(struct iicmux_softc *sc)
 	/*
 	 * Find our FDT node.  Child nodes within our node will become our
 	 * iicbus children.
+	 *
+	 * A mux described by ACPI (or by device hints) has no OFW node;
+	 * ofw_bus_get_node() answers -1 for it, so fall through to the
+	 * generic path below rather than walking a bogus node.
 	 */
-	if((node = ofw_bus_get_node(sc->dev)) == 0) {
-		device_printf(sc->dev, "cannot find FDT node\n");
-		return (ENOENT);
-	}
+	node = ofw_bus_get_node(sc->dev);
+	if (node <= 0)
+		goto generic;
 
 	/*
 	 * First we have to see if there is a child node named "i2c-mux".  If it
@@ -288,6 +291,8 @@ iicmux_attach_children(struct iicmux_softc *sc)
 	/* If we configured anything using FDT data, we're done. */
 	if (sc->maxbus >= 0)
 		return (0);
+
+generic:
 #endif /* FDT */
 
 	/*
@@ -296,6 +301,9 @@ iicmux_attach_children(struct iicmux_softc *sc)
 	 */
 	for (i = 0; i < sc->numbuses; ++i) {
 		sc->childdevs[i] = device_add_child(sc->dev, "iicbus", DEVICE_UNIT_ANY);
+#ifdef FDT
+		sc->childnodes[i] = -1;	/* not described by a device tree */
+#endif
 		sc->maxbus = i;
 	}
 
