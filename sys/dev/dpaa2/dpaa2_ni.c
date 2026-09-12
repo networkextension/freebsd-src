@@ -95,6 +95,7 @@
 #include "dpaa2_swp.h"
 #include "dpaa2_swp_if.h"
 #include "dpaa2_cmd_if.h"
+#include "sff_if.h"
 #include "dpaa2_ni.h"
 #include "dpaa2_channel.h"
 #include "dpaa2_buf.h"
@@ -2598,6 +2599,48 @@ dpaa2_ni_qflush(if_t ifp)
 	if_qflush(ifp);
 }
 
+/*
+ * SFP+ EEPROM access for SIOCGI2C, so "ifconfig -v <dpni>" can show the
+ * module's SFF-8472 identity and diagnostics.
+ *
+ * The transceiver is a device in its own right: firmware names it in the
+ * DPMAC's node -- an "sfp" phandle under FDT, an "sfp" _DSD reference under
+ * ACPI -- and sff(4) drives it.  All this handler does is ask the MC bus for
+ * that device and read from it; it knows neither how the module is wired up
+ * nor which flavour of firmware described it.
+ */
+static int
+dpaa2_ni_sfp_ioctl(struct dpaa2_ni_softc *sc, struct ifreq *ifr)
+{
+	struct ifi2creq req;
+	device_t sffdev;
+	int error;
+
+	error = copyin(ifr_data_get_ptr(ifr), &req, sizeof(req));
+	if (error != 0)
+		return (error);
+	if (req.dev_addr != 0xa0 && req.dev_addr != 0xa2)
+		return (EINVAL);
+	if (req.len == 0 || req.len > (int)sizeof(req.data))
+		return (EINVAL);
+	if ((u_int)req.offset + req.len > 256)
+		return (EINVAL);
+
+	sffdev = NULL;
+	error = DPAA2_MC_GET_SFF_DEV(sc->dev, &sffdev, sc->mac.dpmac_id);
+	if (error != 0)
+		return (error);
+	if (sffdev == NULL)
+		return (ENXIO);
+
+	error = SFF_READ_EEPROM(sffdev, req.dev_addr, req.offset, req.data,
+	    req.len);
+	if (error != 0)
+		return (error);
+
+	return (copyout(&req, ifr_data_get_ptr(ifr), sizeof(req)));
+}
+
 static int
 dpaa2_ni_ioctl(if_t ifp, u_long c, caddr_t data)
 {
@@ -2612,6 +2655,13 @@ dpaa2_ni_ioctl(if_t ifp, u_long c, caddr_t data)
 	uint32_t changed = 0;
 	uint16_t rc_token, ni_token;
 	int mtu, error, rc = 0;
+
+	/*
+	 * The transceiver's EEPROM is on an i2c bus, not behind the MC, so
+	 * answer that one before opening any MC object.
+	 */
+	if (c == SIOCGI2C)
+		return (dpaa2_ni_sfp_ioctl(sc, ifr));
 
 	DPAA2_CMD_INIT(&cmd);
 
@@ -3917,6 +3967,7 @@ DRIVER_MODULE(miibus, dpaa2_ni, miibus_driver, 0, 0);
 DRIVER_MODULE(dpaa2_ni, dpaa2_rc, dpaa2_ni_driver, 0, 0);
 
 MODULE_DEPEND(dpaa2_ni, miibus, 1, 1, 1);
+MODULE_DEPEND(dpaa2_ni, sff, 1, 1, 1);
 #ifdef DEV_ACPI
 MODULE_DEPEND(dpaa2_ni, memac_mdio_acpi, 1, 1, 1);
 #endif
