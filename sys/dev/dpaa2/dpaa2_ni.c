@@ -715,7 +715,89 @@ dpaa2_ni_setup_fixed_link(struct dpaa2_ni_softc *sc)
 static int
 dpaa2_ni_detach(device_t dev)
 {
-	/* TBD */
+	device_t pdev = device_get_parent(dev);
+	device_t child = dev;
+	struct dpaa2_ni_softc *sc = device_get_softc(dev);
+	struct dpaa2_devinfo *rcinfo = device_get_ivars(pdev);
+	struct dpaa2_devinfo *dinfo = device_get_ivars(dev);
+	struct dpaa2_cmd cmd;
+	uint16_t rc_token, ni_token;
+	uint32_t i;
+
+	/*
+	 * Detach the network interface from the stack first. After
+	 * ether_ifdetach() returns no ioctl, transmit or interface-dump path
+	 * (e.g. a netlink GETLINK walk) can reach this interface, so it is
+	 * safe to tear the rest of the device down.
+	 */
+	if (sc->ifp != NULL) {
+		DPNI_LOCK(sc);
+		if_setdrvflagbits(sc->ifp, 0, IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
+		DPNI_UNLOCK(sc);
+		ether_ifdetach(sc->ifp);
+	}
+
+	/* Stop the periodic link-status callout. */
+	callout_drain(&sc->mii_callout);
+
+	/*
+	 * Disable the DPNI and its link-change interrupt in the MC. Once the
+	 * DPNI is disabled the MC stops dequeuing frames to our channels, so
+	 * no further CDANs can be generated.
+	 */
+	DPAA2_CMD_INIT(&cmd);
+	if (DPAA2_CMD_RC_OPEN(dev, child, &cmd, rcinfo->id, &rc_token) == 0) {
+		if (DPAA2_CMD_NI_OPEN(dev, child, &cmd, dinfo->id,
+		    &ni_token) == 0) {
+			(void)DPAA2_CMD_NI_SET_IRQ_ENABLE(dev, child, &cmd,
+			    DPNI_IRQ_INDEX, false);
+			(void)DPAA2_CMD_NI_DISABLE(dev, child, &cmd);
+			(void)DPAA2_CMD_NI_CLOSE(dev, child,
+			    DPAA2_CMD_TK(&cmd, ni_token));
+		}
+		(void)DPAA2_CMD_RC_CLOSE(dev, child,
+		    DPAA2_CMD_TK(&cmd, rc_token));
+	}
+
+	/* Tear down the link-change interrupt handler. */
+	if (sc->intr != NULL)
+		bus_teardown_intr(dev, sc->irq_res, sc->intr);
+	if (sc->irq_res != NULL)
+		bus_release_resource(dev, SYS_RES_IRQ, sc->irq_rid[0],
+		    sc->irq_res);
+	pci_release_msi(dev);
+
+	/*
+	 * Free the buffer-pool replenish taskqueue before the channels: it
+	 * runs ch->bp_task which references the channels, and taskqueue_free()
+	 * drains any pending task.
+	 */
+	if (sc->bp_taskq != NULL) {
+		taskqueue_free(sc->bp_taskq);
+		sc->bp_taskq = NULL;
+	}
+
+	/* Free the per-CPU QBMan channels. */
+	for (i = 0; i < sc->chan_n; i++) {
+		dpaa2_chan_free(sc->channels[i]);
+		sc->channels[i] = NULL;
+	}
+	sc->chan_n = 0;
+
+	/* Detach any child (e.g. miibus) and return DPAA2 objects to the RC. */
+	bus_generic_detach(dev);
+	bus_release_resources(dev, dpaa2_ni_spec, sc->res);
+
+	/* Release the fixed-link media and the interface itself. */
+	if (sc->fixed_link)
+		ifmedia_removeall(&sc->fixed_ifmedia);
+	if (sc->ifp != NULL) {
+		if_free(sc->ifp);
+		sc->ifp = NULL;
+	}
+
+	mtx_destroy(&sc->lock);
+
 	return (0);
 }
 
