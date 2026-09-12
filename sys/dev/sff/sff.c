@@ -42,54 +42,36 @@
 #include "sff.h"
 
 int
-sff_read_eeprom(device_t requester, int muxaddr, uint8_t chsel,
-    uint8_t chrestore, uint8_t dev_addr, uint8_t offset, uint8_t *buf, int len)
+sff_read_eeprom(device_t requester, uint8_t dev_addr, uint8_t offset,
+    uint8_t *buf, int len)
 {
-	device_t bus = device_get_parent(requester);
-	struct iic_msg sel, rd[2];
-	uint8_t off = offset;
-	int error;
+	struct iic_msg msgs[2];
+
+	if (requester == NULL)
+		return (ENXIO);
+	if (buf == NULL || len <= 0 || len > UINT16_MAX)
+		return (EINVAL);
 
 	/*
-	 * Hold the bus across the (optional) mux channel select, the offset
-	 * write and the data read, so no other consumer can switch the mux or
-	 * see it pointed at this device mid-transaction.
+	 * Write the byte offset, then read the data back without releasing
+	 * the bus in between (a repeat-start), so nothing else can move the
+	 * EEPROM's internal address pointer between the two halves.  Holding
+	 * the bus for the whole exchange also keeps an i2c mux upstream
+	 * pointed at this device throughout -- iicbus(4) switches the mux as
+	 * part of granting the bus, and would switch it away again for
+	 * another consumer if we let go.
 	 */
-	error = iicbus_request_bus(bus, requester, IIC_INTRWAIT);
-	if (error != 0)
-		return (iic2errno(error));
+	msgs[0].slave = dev_addr;
+	msgs[0].flags = IIC_M_WR | IIC_M_NOSTOP;
+	msgs[0].len = 1;
+	msgs[0].buf = &offset;
+	msgs[1].slave = dev_addr;
+	msgs[1].flags = IIC_M_RD;
+	msgs[1].len = len;
+	msgs[1].buf = buf;
 
-	if (muxaddr != 0) {
-		sel.slave = (uint16_t)muxaddr << 1;
-		sel.flags = IIC_M_WR;
-		sel.len = 1;
-		sel.buf = &chsel;
-		error = iicbus_transfer(requester, &sel, 1);
-	}
-
-	if (error == 0) {
-		/* Write the byte offset (repeat-start), then read the data. */
-		rd[0].slave = dev_addr;		/* already 8-bit (0xA0/0xA2) */
-		rd[0].flags = IIC_M_WR | IIC_M_NOSTOP;
-		rd[0].len = 1;
-		rd[0].buf = &off;
-		rd[1].slave = dev_addr;
-		rd[1].flags = IIC_M_RD;
-		rd[1].len = len;
-		rd[1].buf = buf;
-		error = iicbus_transfer(requester, rd, 2);
-	}
-
-	if (muxaddr != 0) {
-		sel.slave = (uint16_t)muxaddr << 1;
-		sel.flags = IIC_M_WR;
-		sel.len = 1;
-		sel.buf = &chrestore;
-		(void)iicbus_transfer(requester, &sel, 1);
-	}
-
-	iicbus_release_bus(bus, requester);
-	return (error != 0 ? iic2errno(error) : 0);
+	return (iic2errno(iicbus_transfer_excl(requester, msgs, nitems(msgs),
+	    IIC_INTRWAIT)));
 }
 
 device_t

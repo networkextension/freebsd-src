@@ -156,7 +156,7 @@ sfp_fdt_read_eeprom(device_t dev, uint8_t dev_addr, uint8_t offset,
 	if (requester == NULL)
 		return (ENXIO);
 
-	return (sff_read_eeprom(requester, 0, 0, 0, dev_addr, offset, buf, len));
+	return (sff_read_eeprom(requester, dev_addr, offset, buf, len));
 }
 
 static device_method_t sfp_fdt_methods[] = {

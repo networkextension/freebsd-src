@@ -236,12 +236,21 @@ pca954x_find_chip(device_t dev)
 
 #ifdef DEV_ACPI
 /*
- * Firmware describes the downstream channels of the mux as namespace nodes
- * below the mux itself, each with an _ADR giving its channel number, and
- * describes whatever sits on a channel in that channel's scope.  Record the
- * nodes so that iicbus(4) can be told which scope each channel bus stands
- * for; without that, the channel scopes belong to no bus and nothing
- * firmware placed on a channel is ever enumerated.
+ * Map the mux's downstream channels onto ACPI namespace scopes.
+ *
+ * The binding this expects, which is the one NXP's Layerscape firmware uses
+ * and the same shape Linux looks for:
+ *
+ *   - each channel is a Device directly below the mux's own node;
+ *   - its _ADR is the channel number;
+ *   - whatever sits on that channel is described in that channel's scope,
+ *     with an I2cSerialBus resource whose ResourceSource names the channel.
+ *
+ * Only immediate children are considered: a deeper node belongs to a device
+ * on a channel, not to a channel.  Record the nodes so that iicbus(4) can be
+ * told which scope each channel bus stands for -- without that the channel
+ * scopes belong to no bus, and nothing firmware placed on a channel is ever
+ * enumerated.
  */
 static void
 pca954x_acpi_map_channels(device_t dev)

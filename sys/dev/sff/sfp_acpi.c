@@ -31,10 +31,10 @@
  * The counterpart of sfp_fdt(4).  Firmware describes the cage the same way a
  * device tree does -- a node with compatible "sff,sfp" -- but places it where
  * ACPI places an i2c device: in the scope of the bus its EEPROM answers on,
- * with an I2cSerialBus resource naming the base page address (0xa0 as a 7-bit
- * address, i.e. 0x50).  So where the FDT front-end has to follow an "i2c-bus"
- * phandle to find its bus, this one simply has it as a parent, and it can own
- * the bus request itself rather than borrowing another device on the bus.
+ * with an I2cSerialBus resource giving the base page's 7-bit address, 0x50.
+ * So where the FDT front-end has to follow an "i2c-bus" phandle to find its
+ * bus, this one simply has it as a parent, and it can own the bus request
+ * itself rather than borrowing another device on the bus.
  *
  * Everything above this -- DPAA2_MC_GET_SFF_DEV(), SFF_READ_EEPROM() and the
  * SIOCGI2C handler in the NIC driver -- is shared with the FDT path and knows
@@ -111,12 +111,8 @@ sfp_acpi_read_eeprom(device_t dev, uint8_t dev_addr, uint8_t offset,
     uint8_t *buf, int len)
 {
 
-	/*
-	 * We sit on the bus the EEPROM answers on, so we are our own bus
-	 * requester, and any i2c mux upstream is switched transparently by
-	 * the i2c framework.  No explicit channel select.
-	 */
-	return (sff_read_eeprom(dev, 0, 0, 0, dev_addr, offset, buf, len));
+	/* We sit on the bus the EEPROM answers on, so we own the request. */
+	return (sff_read_eeprom(dev, dev_addr, offset, buf, len));
 }
 
 static device_method_t sfp_acpi_methods[] = {

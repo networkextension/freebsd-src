@@ -29,29 +29,27 @@
 #define _DEV_SFF_SFF_H_
 
 /*
- * Read from an SFP module's EEPROM page over i2c.
+ * Read from an SFP module's EEPROM over i2c.
  *
- * dev_addr is the 8-bit (left-aligned) page address, i.e. 0xA0 for the base
- * SFF-8472 page and 0xA2 for the diagnostics page.  The bus is held for the
- * whole exchange (offset write with a repeat-start, then read).
+ * dev_addr is the slave address in the form iic_msg(9) uses -- the 7-bit
+ * address shifted left by one -- which for an SFF-8472 module is 0xa0 for the
+ * base page and 0xa2 for the diagnostics page.  That is also the form
+ * SIOCGI2C's struct ifi2creq carries, so a NIC driver passes what it was
+ * given.
  *
- * When muxaddr != 0 an i2c-mux channel is selected before the read (by writing
- * chsel to the 7-bit mux address muxaddr) and restored afterwards (chrestore).
- * This is for platforms whose i2c mux has no driver (e.g. some ACPI systems);
- * pass muxaddr == 0 when the mux is switched transparently by the i2c
- * framework, which is the normal FDT case.
- *
- * requester must be a device sitting on the target iicbus (e.g. its iic(4)
- * child); it is used as the bus-request owner.
+ * requester is a device on the iicbus the EEPROM answers on; it owns the bus
+ * for the duration of the exchange.  A front-end that is itself an i2c slave
+ * (the ACPI one) passes itself; one that only holds a reference to the bus
+ * (the FDT one) has to borrow a device on it -- see sff_i2c_requester().
  */
-int	sff_read_eeprom(device_t requester, int muxaddr, uint8_t chsel,
-	    uint8_t chrestore, uint8_t dev_addr, uint8_t offset, uint8_t *buf,
-	    int len);
+int	sff_read_eeprom(device_t requester, uint8_t dev_addr, uint8_t offset,
+	    uint8_t *buf, int len);
 
 /*
  * A bus request needs an owner that sits on the bus being requested.  A
- * transceiver front-end typically has only the iicbus itself, so borrow the
- * iic(4) child every iicbus carries.  Returns NULL if there is none.
+ * front-end that has only the iicbus itself borrows the iic(4) child every
+ * iicbus carries.  Returns NULL if there is none, which sff_read_eeprom()
+ * reports as ENXIO.
  */
 device_t sff_i2c_requester(device_t i2c_bus);
 
