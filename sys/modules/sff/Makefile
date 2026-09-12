@@ -11,6 +11,13 @@ SRCS+=	sfp_fdt.c \
 	ofw_bus_if.h
 .endif
 
+.if ${MACHINE_CPUARCH} == "aarch64" || ${MACHINE_CPUARCH} == "amd64" || \
+    ${MACHINE_CPUARCH} == "i386"
+SRCS+=	sfp_acpi.c \
+	opt_acpi.h \
+	acpi_if.h
+.endif
+
 #
 # sff(4) 存在的意义就是被 NIC 驱动消费:它们需要 sff_read_eeprom() 和
 # SFF_* kobj 方法描述符。没有这行,kmod 构建会把符号全部局部化,
