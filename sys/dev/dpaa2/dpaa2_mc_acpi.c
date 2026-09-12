@@ -123,13 +123,13 @@ dpaa2_mac_dev_attach(device_t dev)
 
 	if (bootverbose)
 		device_printf(dev, "UID %#04x reg %#04jx managed '%s' "
-		    "phy-connection-type '%s' phy-mode '%s' phy-handle '%s'\n",
+		    "phy-connection-type '%s' phy-mode '%s' phy-handle '%s' "
+		    "sfp '%s'\n",
 		    sc->uid, sc->reg, sc->managed[0] != '\0' ? sc->managed : "",
 		    sc->phy_conn_type[0] != '\0' ? sc->phy_conn_type : "",
 		    sc->phy_mode[0] != '\0' ? sc->phy_mode : "",
-		    sc->phy_channel != NULL ? acpi_name(sc->phy_channel) : "");
-	if (bootverbose && sc->sfp != NULL)
-		device_printf(dev, "sfp '%s'\n", acpi_name(sc->sfp));
+		    sc->phy_channel != NULL ? acpi_name(sc->phy_channel) : "",
+		    sc->sfp != NULL ? acpi_name(sc->sfp) : "");
 
 	return (0);
 }
@@ -368,11 +368,6 @@ dpaa2_mc_acpi_get_sff_dev(device_t dev, device_t *sff_dev, uint32_t id)
 
 	if (sff_dev != NULL)
 		*sff_dev = sffdev;
-
-	if (bootverbose)
-		device_printf(dev, "dpmac_id %u mdev %s sff dev %s\n",
-		    id, device_get_nameunit(mdev),
-		    device_get_nameunit(sffdev));
 
 	return (0);
 }

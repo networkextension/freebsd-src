@@ -379,11 +379,6 @@ dpaa2_mc_fdt_get_sff_dev(device_t dev, device_t *sff_dev, uint32_t id)
 	if (sff_dev != NULL)
 		*sff_dev = sffdev;
 
-	if (bootverbose)
-		device_printf(dev, "dpmac_id %u mdev %s sff dev %s\n",
-		    id, device_get_nameunit(mdev),
-		    device_get_nameunit(sffdev));
-
 	return (0);
 }
 
