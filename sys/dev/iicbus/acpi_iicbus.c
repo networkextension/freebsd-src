@@ -321,13 +321,33 @@ err:
 	return (s);
 }
 
+/*
+ * The ACPI namespace scope a given iicbus(4) instance stands for.
+ *
+ * A plain controller drives one bus, and that bus is not a namespace object
+ * of its own: whatever sits on it is described in the controller's scope.
+ * A controller that fans out -- an i2c mux -- drives several buses that
+ * firmware does describe separately, one node per downstream channel.  Such
+ * a parent answers ACPI_IVAR_HANDLE for each of its child buses, with the
+ * node for that channel, or with NULL for a channel firmware left
+ * undescribed.
+ */
+static ACPI_HANDLE
+acpi_iicbus_get_scope(device_t iicbus)
+{
+
+	if (acpi_has_handle(iicbus))
+		return (acpi_get_handle(iicbus));
+	return (acpi_get_handle(device_get_parent(iicbus)));
+}
+
 static int
 acpi_iicbus_install_address_space_handler(struct acpi_iicbus_softc *sc)
 {
 	ACPI_HANDLE handle;
 	ACPI_STATUS s;
 
-	handle = acpi_get_handle(device_get_parent(sc->super_sc.dev));
+	handle = acpi_iicbus_get_scope(sc->super_sc.dev);
 	s = AcpiInstallAddressSpaceHandler(handle, ACPI_ADR_SPACE_GSBUS,
 	    &acpi_iicbus_space_handler, NULL, &sc->space_handler_info);
 	if (ACPI_FAILURE(s)) {
@@ -345,7 +365,7 @@ acpi_iicbus_remove_address_space_handler(struct acpi_iicbus_softc *sc)
 	ACPI_HANDLE handle;
 	ACPI_STATUS s;
 
-	handle = acpi_get_handle(device_get_parent(sc->super_sc.dev));
+	handle = acpi_iicbus_get_scope(sc->super_sc.dev);
 	s = AcpiRemoveAddressSpaceHandler(handle, ACPI_ADR_SPACE_GSBUS,
 	    &acpi_iicbus_space_handler);
 	if (ACPI_FAILURE(s)) {
@@ -488,8 +508,7 @@ acpi_iicbus_enumerate_child(ACPI_HANDLE handle, UINT32 level,
 	if (ACPI_FAILURE(acpi_iicbus_get_i2cres(handle, &sb)) ||
 	    sb.SlaveAddress == 0)
 		return (AE_OK);
-	if (sb.ResourceSource_Handle !=
-	    acpi_get_handle(device_get_parent(iicbus)))
+	if (sb.ResourceSource_Handle != acpi_iicbus_get_scope(iicbus))
 		return (AE_OK);
 	if (bootverbose)
 		acpi_iicbus_dump_res(iicbus, &sb);
@@ -576,7 +595,7 @@ acpi_iicbus_probe(device_t dev)
 	if (controller == NULL)
 		return (ENXIO);
 
-	handle = acpi_get_handle(controller);
+	handle = acpi_iicbus_get_scope(dev);
 	if (handle == NULL)
 		return (ENXIO);
 

@@ -130,6 +130,10 @@ static const struct {
 
 struct pca954x_softc {
 	struct iicmux_softc mux;
+#ifdef DEV_ACPI
+	/* Namespace node firmware described each downstream channel with. */
+	ACPI_HANDLE	childhandles[IICMUX_MAX_BUSES];
+#endif
 	const struct pca954x_descr *descr;
 	uint8_t addr;
 	bool idle_disconnect;
@@ -230,6 +234,76 @@ pca954x_find_chip(device_t dev)
 	return (NULL);
 }
 
+#ifdef DEV_ACPI
+/*
+ * Map the mux's downstream channels onto ACPI namespace scopes.
+ *
+ * The binding this expects, which is the one NXP's Layerscape firmware uses
+ * and the same shape Linux looks for:
+ *
+ *   - each channel is a Device directly below the mux's own node;
+ *   - its _ADR is the channel number;
+ *   - whatever sits on that channel is described in that channel's scope,
+ *     with an I2cSerialBus resource whose ResourceSource names the channel.
+ *
+ * Only immediate children are considered: a deeper node belongs to a device
+ * on a channel, not to a channel.  Record the nodes so that iicbus(4) can be
+ * told which scope each channel bus stands for -- without that the channel
+ * scopes belong to no bus, and nothing firmware placed on a channel is ever
+ * enumerated.
+ */
+static void
+pca954x_acpi_map_channels(device_t dev)
+{
+	struct pca954x_softc *sc = device_get_softc(dev);
+	ACPI_HANDLE handle, child;
+	UINT32 adr;
+
+	if ((handle = acpi_get_handle(dev)) == NULL)
+		return;
+
+	child = NULL;
+	while (ACPI_SUCCESS(AcpiGetNextObject(ACPI_TYPE_DEVICE, handle, child,
+	    &child))) {
+		if (ACPI_FAILURE(acpi_GetInteger(child, "_ADR", &adr)))
+			continue;
+		if (adr >= sc->descr->numchannels) {
+			device_printf(dev,
+			    "%s: _ADR %u exceeds the number of channels "
+			    "supported by the device (%u)\n", acpi_name(child),
+			    adr, sc->descr->numchannels);
+			continue;
+		}
+		sc->childhandles[adr] = child;
+	}
+}
+#endif /* DEV_ACPI */
+
+static int
+pca954x_read_ivar(device_t dev, device_t child, int which, uintptr_t *result)
+{
+#ifdef DEV_ACPI
+	struct pca954x_softc *sc = device_get_softc(dev);
+	int i;
+
+	/*
+	 * Answer for our child buses, so that an ACPI-aware iicbus(4) can
+	 * find the scope its channel was described in.  Answering with a
+	 * NULL handle is not the same as declining: it says this channel is
+	 * ours and firmware did not describe it.
+	 */
+	if (which == ACPI_IVAR_HANDLE) {
+		for (i = 0; i <= sc->mux.maxbus; ++i) {
+			if (sc->mux.childdevs[i] != child)
+				continue;
+			*result = (uintptr_t)sc->childhandles[i];
+			return (0);
+		}
+		return (ENOENT);
+	}
+#endif
+	return (bus_generic_read_ivar(dev, child, which, result));
+}
 
 static int
 pca954x_probe(device_t dev)
@@ -256,6 +330,9 @@ pca954x_attach(device_t dev)
 	sc->idle_disconnect = device_has_property(dev, "i2c-mux-idle-disconnect");
 
 	sc->descr = descr = pca954x_find_chip(dev);
+#ifdef DEV_ACPI
+	pca954x_acpi_map_channels(dev);
+#endif
 	error = iicmux_attach(dev, device_get_parent(dev), descr->numchannels);
 	if (error == 0)
                 bus_attach_children(dev);
@@ -278,6 +355,9 @@ static device_method_t pca954x_methods[] = {
 	DEVMETHOD(device_attach,		pca954x_attach),
 	DEVMETHOD(device_detach,		pca954x_detach),
 
+	/* bus methods */
+	DEVMETHOD(bus_read_ivar,		pca954x_read_ivar),
+
 	/* iicmux methods */
 	DEVMETHOD(iicmux_bus_select,		pca954x_bus_select),
 
@@ -289,13 +369,17 @@ DEFINE_CLASS_1(pca954x, pca954x_driver, pca954x_methods,
 DRIVER_MODULE(pca954x, iicbus, pca954x_driver, 0, 0);
 
 /*
- * Register both downstream bus drivers: they share the "iicbus" devclass and
- * ofw_iicbus_probe() declines (ENXIO) when the child bus has no OFW node, so
- * the right one attaches for the way the mux was described.
+ * Register every downstream bus driver: they share the "iicbus" devclass, and
+ * each of the firmware-aware ones declines (ENXIO) when the child bus has no
+ * node of its own, so the right one attaches for the way the mux -- and the
+ * individual channel -- was described.
  */
 DRIVER_MODULE(iicbus, pca954x, iicbus_driver, 0, 0);
 #ifdef FDT
 DRIVER_MODULE(ofw_iicbus, pca954x, ofw_iicbus_driver, 0, 0);
+#endif
+#ifdef DEV_ACPI
+DRIVER_MODULE(acpi_iicbus, pca954x, acpi_iicbus_driver, 0, 0);
 #endif
 
 MODULE_DEPEND(pca954x, iicmux, 1, 1, 1);
