@@ -28,6 +28,7 @@
  */
 
 #include <sys/cdefs.h>
+#include "opt_acpi.h"
 #include "opt_platform.h"
 
 #include <sys/param.h>
@@ -40,6 +41,11 @@
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/openfirm.h>
+#endif
+
+#ifdef DEV_ACPI
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
 #endif
 
 #include <dev/iicbus/iicbus.h>
@@ -91,6 +97,13 @@ static struct pca954x_descr pca9548_descr = {
 	.numchannels = 8,
 };
 
+static const struct pca954x_descr *part_descrs[] = {
+	&pca9540_descr,
+	&pca9546_descr,
+	&pca9547_descr,
+	&pca9548_descr,
+};
+
 #ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 	{ "nxp,pca9540", (uintptr_t)&pca9540_descr },
@@ -99,12 +112,19 @@ static struct ofw_compat_data compat_data[] = {
 	{ "nxp,pca9548", (uintptr_t)&pca9548_descr },
 	{ NULL, 0 },
 };
-#else
-static struct pca954x_descr *part_descrs[] = {
-	&pca9540_descr,
-	&pca9546_descr,
-	&pca9547_descr,
-	&pca9548_descr,
+#endif
+
+#ifdef DEV_ACPI
+/*
+ * ACPI firmware identifies these parts by _HID rather than by a compatible
+ * string.  NXP's Layerscape reference firmware declares the on-board PCA9547
+ * this way; the part is fixed by the platform, so the HID identifies it.
+ */
+static const struct {
+	const char			*hid;
+	const struct pca954x_descr	*descr;
+} acpi_ids[] = {
+	{ "NXP0002",	&pca9547_descr },
 };
 #endif
 
@@ -162,29 +182,52 @@ pca954x_bus_select(device_t dev, int busidx, struct iic_reqbus_data *rd)
 static const struct pca954x_descr *
 pca954x_find_chip(device_t dev)
 {
-#ifdef FDT
-	const struct ofw_compat_data *compat;
-
-	if (!ofw_bus_status_okay(dev))
-		return (NULL);
-
-	compat = ofw_bus_search_compatible(dev, compat_data);
-	if (compat == NULL)
-		return (NULL);
-	return ((const struct pca954x_descr *)compat->ocd_data);
-#else
 	const char *type;
-	int i;
+	u_int i;
 
+	/*
+	 * Dispatch on how this device was actually described rather than on
+	 * which firmware interfaces the kernel was built with: an arm64 kernel
+	 * carries both FDT and ACPI support and may be booted either way.
+	 */
+#ifdef FDT
+	if (ofw_bus_get_node(dev) != -1) {
+		const struct ofw_compat_data *compat;
+
+		if (!ofw_bus_status_okay(dev))
+			return (NULL);
+
+		compat = ofw_bus_search_compatible(dev, compat_data);
+		if (compat == NULL)
+			return (NULL);
+		return ((const struct pca954x_descr *)compat->ocd_data);
+	}
+#endif
+
+#ifdef DEV_ACPI
+	{
+		ACPI_HANDLE handle;
+
+		handle = acpi_get_handle(dev);
+		if (handle != NULL) {
+			for (i = 0; i < nitems(acpi_ids); ++i) {
+				if (acpi_MatchHid(handle, acpi_ids[i].hid))
+					return (acpi_ids[i].descr);
+			}
+			return (NULL);
+		}
+	}
+#endif
+
+	/* Described by neither firmware: fall back to device hints. */
 	if (resource_string_value(device_get_name(dev), device_get_unit(dev),
 	    "chip_type", &type) == 0) {
-		for (i = 0; i < nitems(part_descrs) - 1; ++i) {
+		for (i = 0; i < nitems(part_descrs); ++i) {
 			if (strcasecmp(type, part_descrs[i]->partname) == 0)
 				return (part_descrs[i]);
 		}
 	}
 	return (NULL);
-#endif
 }
 
 static int
@@ -244,10 +287,14 @@ DEFINE_CLASS_1(pca954x, pca954x_driver, pca954x_methods,
     sizeof(struct pca954x_softc), iicmux_driver);
 DRIVER_MODULE(pca954x, iicbus, pca954x_driver, 0, 0);
 
+/*
+ * Register both downstream bus drivers: they share the "iicbus" devclass and
+ * ofw_iicbus_probe() declines (ENXIO) when the child has no OFW node, so the
+ * right one attaches for the way the mux was described.
+ */
+DRIVER_MODULE(iicbus, pca954x, iicbus_driver, 0, 0);
 #ifdef FDT
 DRIVER_MODULE(ofw_iicbus, pca954x, ofw_iicbus_driver, 0, 0);
-#else
-DRIVER_MODULE(iicbus, pca954x, iicbus_driver, 0, 0);
 #endif
 
 MODULE_DEPEND(pca954x, iicmux, 1, 1, 1);
