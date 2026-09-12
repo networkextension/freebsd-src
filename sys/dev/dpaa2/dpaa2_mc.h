@@ -120,6 +120,7 @@ struct dpaa2_rc_softc {
 	device_t		 dev;
 	int			 unit;
 	uint32_t		 cont_id;
+	struct cdev		*cdev;	/* /dev/dpaa2rcN control device */
 };
 
 /**

@@ -1,0 +1,13 @@
+#
+# 模块加载测试内核:把 sff / dpaa2 / pca954x / iicmux 从静态改成模块,
+# 由 loader 加载。用来验证 arch.md §15 —— "主内核能编、模块死" 那一类问题。
+#
+include GENERIC
+ident		LX2160A-MODTEST
+
+# 顺序即 loader 的预加载顺序,必须满足依赖:
+# pca954x 依赖 iicmux,dpaa2 依赖 sff。
+nodevice	sff
+nodevice	iicmux
+nodevice	pca954x
+nodevice	dpaa2

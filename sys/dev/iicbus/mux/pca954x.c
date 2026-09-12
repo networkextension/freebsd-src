@@ -28,6 +28,7 @@
  */
 
 #include <sys/cdefs.h>
+#include "opt_acpi.h"
 #include "opt_platform.h"
 
 #include <sys/param.h>
@@ -40,6 +41,11 @@
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 #include <dev/ofw/openfirm.h>
+#endif
+
+#ifdef DEV_ACPI
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
 #endif
 
 #include <dev/iicbus/iicbus.h>
@@ -91,6 +97,13 @@ static struct pca954x_descr pca9548_descr = {
 	.numchannels = 8,
 };
 
+static const struct pca954x_descr *part_descrs[] = {
+	&pca9540_descr,
+	&pca9546_descr,
+	&pca9547_descr,
+	&pca9548_descr,
+};
+
 #ifdef FDT
 static struct ofw_compat_data compat_data[] = {
 	{ "nxp,pca9540", (uintptr_t)&pca9540_descr },
@@ -99,17 +112,28 @@ static struct ofw_compat_data compat_data[] = {
 	{ "nxp,pca9548", (uintptr_t)&pca9548_descr },
 	{ NULL, 0 },
 };
-#else
-static struct pca954x_descr *part_descrs[] = {
-	&pca9540_descr,
-	&pca9546_descr,
-	&pca9547_descr,
-	&pca9548_descr,
+#endif
+
+#ifdef DEV_ACPI
+/*
+ * ACPI firmware identifies these parts by _HID rather than by a compatible
+ * string.  NXP's Layerscape reference firmware declares the on-board PCA9547
+ * this way; the part is fixed by the platform, so the HID identifies it.
+ */
+static const struct {
+	const char			*hid;
+	const struct pca954x_descr	*descr;
+} acpi_ids[] = {
+	{ "NXP0002",	&pca9547_descr },
 };
 #endif
 
 struct pca954x_softc {
 	struct iicmux_softc mux;
+#ifdef DEV_ACPI
+	/* Namespace node firmware described each downstream channel with. */
+	ACPI_HANDLE	childhandles[IICMUX_MAX_BUSES];
+#endif
 	const struct pca954x_descr *descr;
 	uint8_t addr;
 	bool idle_disconnect;
@@ -162,29 +186,114 @@ pca954x_bus_select(device_t dev, int busidx, struct iic_reqbus_data *rd)
 static const struct pca954x_descr *
 pca954x_find_chip(device_t dev)
 {
-#ifdef FDT
-	const struct ofw_compat_data *compat;
-
-	if (!ofw_bus_status_okay(dev))
-		return (NULL);
-
-	compat = ofw_bus_search_compatible(dev, compat_data);
-	if (compat == NULL)
-		return (NULL);
-	return ((const struct pca954x_descr *)compat->ocd_data);
-#else
 	const char *type;
-	int i;
+	u_int i;
 
+	/*
+	 * Dispatch on how this device was actually described rather than on
+	 * which firmware interfaces the kernel was built with: an arm64 kernel
+	 * carries both FDT and ACPI support and may be booted either way.
+	 */
+#ifdef FDT
+	if (ofw_bus_get_node(dev) != -1) {
+		const struct ofw_compat_data *compat;
+
+		if (!ofw_bus_status_okay(dev))
+			return (NULL);
+
+		compat = ofw_bus_search_compatible(dev, compat_data);
+		if (compat == NULL)
+			return (NULL);
+		return ((const struct pca954x_descr *)compat->ocd_data);
+	}
+#endif
+
+#ifdef DEV_ACPI
+	{
+		ACPI_HANDLE handle;
+
+		handle = acpi_get_handle(dev);
+		if (handle != NULL) {
+			for (i = 0; i < nitems(acpi_ids); ++i) {
+				if (acpi_MatchHid(handle, acpi_ids[i].hid))
+					return (acpi_ids[i].descr);
+			}
+			return (NULL);
+		}
+	}
+#endif
+
+	/* Described by neither firmware: fall back to device hints. */
 	if (resource_string_value(device_get_name(dev), device_get_unit(dev),
 	    "chip_type", &type) == 0) {
-		for (i = 0; i < nitems(part_descrs) - 1; ++i) {
+		for (i = 0; i < nitems(part_descrs); ++i) {
 			if (strcasecmp(type, part_descrs[i]->partname) == 0)
 				return (part_descrs[i]);
 		}
 	}
 	return (NULL);
+}
+
+#ifdef DEV_ACPI
+/*
+ * Firmware describes the downstream channels of the mux as namespace nodes
+ * below the mux itself, each with an _ADR giving its channel number, and
+ * describes whatever sits on a channel in that channel's scope.  Record the
+ * nodes so that iicbus(4) can be told which scope each channel bus stands
+ * for; without that, the channel scopes belong to no bus and nothing
+ * firmware placed on a channel is ever enumerated.
+ */
+static void
+pca954x_acpi_map_channels(device_t dev)
+{
+	struct pca954x_softc *sc = device_get_softc(dev);
+	ACPI_HANDLE handle, child;
+	UINT32 adr;
+
+	if ((handle = acpi_get_handle(dev)) == NULL)
+		return;
+
+	child = NULL;
+	while (ACPI_SUCCESS(AcpiGetNextObject(ACPI_TYPE_DEVICE, handle, child,
+	    &child))) {
+		if (ACPI_FAILURE(acpi_GetInteger(child, "_ADR", &adr)))
+			continue;
+		if (adr >= sc->descr->numchannels) {
+			device_printf(dev,
+			    "%s: _ADR %u exceeds the number of channels "
+			    "supported by the device (%u)\n", acpi_name(child),
+			    adr, sc->descr->numchannels);
+			continue;
+		}
+		sc->childhandles[adr] = child;
+	}
+}
+#endif /* DEV_ACPI */
+
+static int
+pca954x_read_ivar(device_t dev, device_t child, int which, uintptr_t *result)
+{
+#ifdef DEV_ACPI
+	struct pca954x_softc *sc = device_get_softc(dev);
+	int i;
+
+	/*
+	 * Answer for our child buses, so that an ACPI-aware iicbus(4) can
+	 * find the scope its channel was described in.  Answering with a
+	 * NULL handle is not the same as declining: it says this channel is
+	 * ours and firmware did not describe it.
+	 */
+	if (which == ACPI_IVAR_HANDLE) {
+		for (i = 0; i <= sc->mux.maxbus; ++i) {
+			if (sc->mux.childdevs[i] != child)
+				continue;
+			*result = (uintptr_t)sc->childhandles[i];
+			return (0);
+		}
+		return (ENOENT);
+	}
 #endif
+	return (bus_generic_read_ivar(dev, child, which, result));
 }
 
 static int
@@ -212,6 +321,9 @@ pca954x_attach(device_t dev)
 	sc->idle_disconnect = device_has_property(dev, "i2c-mux-idle-disconnect");
 
 	sc->descr = descr = pca954x_find_chip(dev);
+#ifdef DEV_ACPI
+	pca954x_acpi_map_channels(dev);
+#endif
 	error = iicmux_attach(dev, device_get_parent(dev), descr->numchannels);
 	if (error == 0)
                 bus_attach_children(dev);
@@ -234,6 +346,9 @@ static device_method_t pca954x_methods[] = {
 	DEVMETHOD(device_attach,		pca954x_attach),
 	DEVMETHOD(device_detach,		pca954x_detach),
 
+	/* bus methods */
+	DEVMETHOD(bus_read_ivar,		pca954x_read_ivar),
+
 	/* iicmux methods */
 	DEVMETHOD(iicmux_bus_select,		pca954x_bus_select),
 
@@ -244,13 +359,24 @@ DEFINE_CLASS_1(pca954x, pca954x_driver, pca954x_methods,
     sizeof(struct pca954x_softc), iicmux_driver);
 DRIVER_MODULE(pca954x, iicbus, pca954x_driver, 0, 0);
 
+/*
+ * Register every downstream bus driver: they share the "iicbus" devclass, and
+ * each of the firmware-aware ones declines (ENXIO) when the child bus has no
+ * node of its own, so the right one attaches for the way the mux -- and the
+ * individual channel -- was described.
+ */
+DRIVER_MODULE(iicbus, pca954x, iicbus_driver, 0, 0);
 #ifdef FDT
 DRIVER_MODULE(ofw_iicbus, pca954x, ofw_iicbus_driver, 0, 0);
-#else
-DRIVER_MODULE(iicbus, pca954x, iicbus_driver, 0, 0);
+#endif
+#ifdef DEV_ACPI
+DRIVER_MODULE(acpi_iicbus, pca954x, acpi_iicbus_driver, 0, 0);
 #endif
 
 MODULE_DEPEND(pca954x, iicmux, 1, 1, 1);
+#ifdef DEV_ACPI
+MODULE_DEPEND(pca954x, acpi, 1, 1, 1);
+#endif
 MODULE_DEPEND(pca954x, iicbus, IICBUS_MINVER, IICBUS_PREFVER, IICBUS_MAXVER);
 MODULE_VERSION(pca954x, 1);
 

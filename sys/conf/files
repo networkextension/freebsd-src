@@ -3173,6 +3173,7 @@ dev/sdio/sdio_if.m		optional mmccam
 dev/sdio/sdio_subr.c		optional mmccam
 dev/sdio/sdiob.c		optional mmccam
 dev/sff/sff_if.m		optional sff
+dev/sff/sff.c			optional sff
 dev/sff/sfp_fdt.c		optional sff fdt
 dev/sge/if_sge.c		optional sge pci
 dev/siis/siis.c			optional siis pci
