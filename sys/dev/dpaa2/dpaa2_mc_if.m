@@ -106,6 +106,15 @@ CODE {
 			    phy_dev, id));
 		return (ENXIO);
 	}
+
+	static int
+	bypass_get_sff_dev(device_t dev, device_t *sff_dev, uint32_t id)
+	{
+		if (device_get_parent(dev) != NULL)
+			return (DPAA2_MC_GET_SFF_DEV(device_get_parent(dev),
+			    sff_dev, id));
+		return (ENXIO);
+	}
 }
 
 METHOD int manage_dev {
@@ -150,3 +159,22 @@ METHOD int get_phy_dev {
 	device_t	 *phy_dev;
 	uint32_t	 id;
 } DEFAULT bypass_get_phy_dev;
+
+/**
+ * @brief Look up the "sff,sfp" device associated with a DPMAC.
+ *
+ * Resolved from the "sfp" reference in the DPMAC's firmware node: a phandle
+ * under FDT, a _DSD reference under ACPI.  Either way the sff(4) transceiver
+ * device is looked up from it, so the caller does not learn which of the two
+ * described the hardware.  Returns ENXIO when firmware names no transceiver
+ * for this DPMAC.
+ *
+ *   dev     - requesting device (walked up to the MC bus)
+ *   sff_dev - the sff,sfp transceiver device (call SFF_READ_EEPROM() on it)
+ *   id      - DPMAC object id
+ */
+METHOD int get_sff_dev {
+	device_t	 dev;
+	device_t	 *sff_dev;
+	uint32_t	 id;
+} DEFAULT bypass_get_sff_dev;
